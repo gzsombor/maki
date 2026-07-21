@@ -1,6 +1,7 @@
 mod cli;
 mod cmd;
 mod print;
+mod sandbox;
 mod sdk_mode;
 mod setup;
 mod update;
@@ -11,7 +12,11 @@ use cli::Cli;
 
 fn main() {
     color_eyre::install().ok();
-    if let Err(e) = cmd::dispatch(Cli::parse()) {
+    let cli = Cli::parse();
+    if cli.sandbox_inner {
+        maki_sandbox::child::child_inner_main();
+    }
+    if let Err(e) = cmd::dispatch(cli) {
         print_error(&e);
         std::process::exit(1);
     }

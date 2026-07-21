@@ -114,6 +114,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Reload plugins and config",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/sandbox",
+        description: "Open sandbox environment info, file browser, and shell",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {

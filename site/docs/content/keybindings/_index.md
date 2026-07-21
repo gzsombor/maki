@@ -21,6 +21,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
 | `Ctrl+M` | Model picker |
+| `Ctrl+I` | Inspect sandbox configuration |
 
 ## Editing
 
@@ -86,6 +87,13 @@ Some pickers add extra bindings on top of the defaults:
 | Queue | `Enter` | Remove item |
 | Commands | `Tab` | Complete command |
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
+| Sandbox | `Tab` | Switch mode (Info/Browse/Shell) |
+| Sandbox | `Enter` | Open directory / run command |
+| Sandbox | `Esc` | Close / go back |
+| Sandbox | `Backspace` | Go to parent directory |
+| Sandbox | `↑` / `↓` | Navigate entries |
+| Sandbox | `PageUp` / `PageDown` | Scroll page up / down |
+| Sandbox | `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
@@ -102,7 +110,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Sandbox
 
 ## Overriding Keybindings
 

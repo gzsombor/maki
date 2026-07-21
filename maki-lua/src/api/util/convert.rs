@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
 
-pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
+pub fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {
     let mut iter = values.into_iter();
     match iter.next() {
         Some(Value::String(s)) => Ok(s.to_string_lossy()),
@@ -25,7 +25,7 @@ pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String
 /// serializes as a little tagged struct instead of a plain scalar, so plugins
 /// end up with a Lua table where they asked for a number. We walk the tree
 /// ourselves to keep numbers as numbers.
-pub(crate) fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
+pub fn json_to_lua(lua: &Lua, value: &JsonValue) -> LuaResult<Value> {
     Ok(match value {
         JsonValue::Null => Value::Nil,
         JsonValue::Bool(b) => Value::Boolean(*b),

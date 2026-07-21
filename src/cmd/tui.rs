@@ -32,6 +32,7 @@ struct Stack {
     commands: Vec<CustomCommand>,
     model: Model,
     needs_login: bool,
+    sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
 impl Stack {
@@ -94,6 +95,12 @@ fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
+    }
+    if cli.sandbox {
+        maki_sandbox::namespace::probe()
+            .map_err(|e| color_eyre::eyre::eyre!("{e}"))
+            .context("sandbox preflight check failed -- cannot start with --sandbox")?;
+        config.agent.sandbox_enabled = true;
     }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli
@@ -159,6 +166,33 @@ fn build_stack(
         }
     }
 
+    let sandbox = if config.agent.sandbox_enabled {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let workspace_name = cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ns_config = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
+            config.agent.sandbox_allowed_env.clone(),
+            &config.agent.sandbox_allowed_paths,
+            &config.agent.sandbox_extra_dirs,
+            cwd,
+            workspace_name,
+        );
+        let sandbox = maki_sandbox::Sandbox::new(ns_config).context("initialize sandbox")?;
+        let sandbox_for_runner = Arc::clone(&sandbox);
+        let runner: std::sync::Arc<maki_lua::SandboxRunner> =
+            std::sync::Arc::new(move |lua, code, timeout, fns| {
+                let sandbox = Arc::clone(&sandbox_for_runner);
+                Box::pin(async move {
+                    crate::sandbox::run_sandbox_with(&sandbox, lua, code, timeout, fns).await
+                })
+            });
+        plugin_host.set_sandbox_config(runner).ok().map(|_| sandbox)
+    } else {
+        None
+    };
+
     let commands = discover_commands(cli.no_commands);
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, storage);
@@ -182,6 +216,7 @@ fn build_stack(
             commands,
             model,
             needs_login,
+            sandbox,
         },
         warnings,
     ))
@@ -343,6 +378,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                sandbox: stack.sandbox.as_ref().map(Arc::clone),
             },
             initial_prompt.take(),
         )

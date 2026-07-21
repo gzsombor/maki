@@ -15,7 +15,7 @@ use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem, SandboxRunner};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -447,6 +447,16 @@ impl PluginHost {
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
+    }
+
+    pub fn set_sandbox_config(&self, runner: Arc<SandboxRunner>) -> Result<(), PluginError>{
+        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxConfig(runner))
+        {
+            tracing::warn!("failed to send sandbox config to lua runtime: {e}");
+            Err(PluginError::HostDead)
+        } else {
+            Ok(())
+        }
     }
 }
 

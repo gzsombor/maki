@@ -26,6 +26,7 @@ use mlua::{Chunk, ChunkMode, Compiler, Function, Lua, RegistryKey, Table, Value 
 use serde_json::Value;
 
 use maki_config::RawConfig;
+use maki_interpreter::runner::InterpreterResult;
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
@@ -47,6 +48,21 @@ use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+
+/// Callback for running Python code inside an OS-level sandbox.
+///
+/// The binary crate provides this callback, which orchestrates the sandbox
+/// lifecycle (setup, IPC, tool dispatch). The Lua crate calls it from
+/// `interpreter_run` when a sandbox is configured.
+pub type SandboxRunner = dyn Fn(
+        Lua,
+        String,
+        Duration,
+        HashMap<String, Function>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Result<InterpreterResult, String>, mlua::Error>> + Send>,
+    > + Send
+    + Sync;
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -197,6 +213,7 @@ pub enum Request {
         /// `row`) instead of dropping the click.
         fallback: Option<Box<ClickFallback>>,
     },
+    SetSandboxConfig(Arc<SandboxRunner>),
     RunKeybindCallback {
         id: u64,
     },
@@ -2868,6 +2885,9 @@ pub fn spawn(
                                 let _ = reply.send(());
                             })
                             .detach();
+                        }
+                        Request::SetSandboxConfig(runner) => {
+                            rt.lua.set_app_data(runner);
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {

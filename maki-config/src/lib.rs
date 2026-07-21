@@ -30,6 +30,7 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+pub const DEFAULT_SANDBOX_ENABLED: bool = false;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -486,6 +487,10 @@ pub struct AgentFileConfig {
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
+    pub sandbox_enabled: Option<bool>,
+    pub sandbox_allowed_env: Option<Vec<String>>,
+    pub sandbox_allowed_paths: Option<Vec<String>>,
+    pub sandbox_extra_dirs: Option<Vec<String>>,
 }
 
 impl AgentFileConfig {
@@ -499,7 +504,11 @@ impl AgentFileConfig {
             compaction_buffer,
             compaction_instructions,
             post_compaction_instructions,
-            stale_read_check
+            stale_read_check,
+            sandbox_enabled,
+            sandbox_allowed_env,
+            sandbox_allowed_paths,
+            sandbox_extra_dirs
         );
     }
 }
@@ -1059,6 +1068,24 @@ pub struct AgentConfig {
     )]
     pub stale_read_check: bool,
 
+    #[config(
+        default = false,
+        desc = "Run code execution in a sandboxed child process with namespace isolation"
+    )]
+    pub sandbox_enabled: bool,
+
+    #[config(skip, default = "Vec::new()")]
+    pub sandbox_allowed_env: Vec<String>,
+
+    #[config(skip, default = "Vec::new()")]
+    pub sandbox_allowed_paths: Vec<String>,
+
+    /// Extra host directories to bind-mount into the sandbox workspace.
+    /// Each entry is a host path (e.g. "~/src/secrets/my-project"); the
+    /// leaf directory name is used inside the workspace.
+    #[config(skip, default = "Vec::new()")]
+    pub sandbox_extra_dirs: Vec<String>,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -1085,6 +1112,10 @@ impl AgentConfig {
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
+            sandbox_enabled: file.sandbox_enabled.unwrap_or(DEFAULT_SANDBOX_ENABLED),
+            sandbox_allowed_env: file.sandbox_allowed_env.unwrap_or_default(),
+            sandbox_allowed_paths: file.sandbox_allowed_paths.unwrap_or_default(),
+            sandbox_extra_dirs: file.sandbox_extra_dirs.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -1970,6 +2001,36 @@ fn insert_permission_entry(
             }
         }
     }
+    Ok(())
+}
+
+/// Persist `agent.sandbox_enabled` to the project's `.maki/config.toml`.
+///
+/// Creates the file and `[agent]` section if they don't exist.
+/// Preserves all other settings in the file.
+pub fn save_sandbox_enabled(cwd: &Path, enabled: bool) -> Result<(), String> {
+    let maki_dir = cwd.join(PROJECT_DIR);
+    let path = maki_dir.join("config.toml");
+    let content = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read .maki/config.toml: {e}"))?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse .maki/config.toml: {e}"))?;
+
+    let agent = doc
+        .entry("agent")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let agent_table = agent
+        .as_table_mut()
+        .ok_or_else(|| "agent section is not a table".to_string())?;
+    agent_table.insert("sandbox_enabled", toml_edit::value(enabled));
+
+    std::fs::create_dir_all(&maki_dir).map_err(|e| format!("cannot create .maki dir: {e}"))?;
+    maki_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write .maki/config.toml: {e}"))?;
     Ok(())
 }
 

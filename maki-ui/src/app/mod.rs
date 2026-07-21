@@ -40,6 +40,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::sandbox_modal::SandboxModal;
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::status_bar::StatusBar;
@@ -227,6 +228,7 @@ pub struct App {
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
+    pub(super) sandbox_modal: SandboxModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
@@ -321,6 +323,18 @@ impl App {
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
+            sandbox_modal: SandboxModal::new(
+                crate::components::sandbox_modal::SandboxInfo {
+                    enabled: false,
+                    env_entries: vec![],
+                    workspace_dir: String::new(),
+                    workspace_name: String::new(),
+                    home_mounts: vec![],
+                    profiles: vec![],
+                    extra_workspace_dirs: vec![],
+                },
+                None,
+            ),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
@@ -502,6 +516,10 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        if self.sandbox_modal.is_open() {
+            self.sandbox_modal.scroll(delta);
+            return None;
+        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -577,6 +595,10 @@ impl App {
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
+        }
+        if key::SANDBOX.matches(key) {
+            self.sandbox_modal.toggle();
+            return Some(vec![]);
         }
         if key::TASKS.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Tasks));
@@ -699,6 +721,19 @@ impl App {
                     vec![]
                 }
             });
+        }
+
+        if self.sandbox_modal.is_open() {
+            self.sandbox_modal.handle_key(key);
+            if self.sandbox_modal.take_enabled_changed() {
+                let enabled = self.sandbox_modal.is_enabled();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                if let Err(e) = maki_config::save_sandbox_enabled(&cwd, enabled) {
+                    self.status_bar
+                        .flash(format!("failed to save sandbox setting: {e}"));
+                }
+            }
+            return Some(vec![]);
         }
 
         if self.queue.focus().is_some() {
@@ -1474,6 +1509,10 @@ impl App {
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            "/sandbox" => {
+                self.sandbox_modal.toggle();
+                vec![]
+            }
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1604,13 +1643,14 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
+            &self.sandbox_modal,
             &self.file_picker,
             &self.task_picker,
             &self.rewind_picker,
@@ -1622,13 +1662,14 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
+            &mut self.sandbox_modal,
             &mut self.file_picker,
             &mut self.task_picker,
             &mut self.rewind_picker,
@@ -1774,6 +1815,9 @@ impl App {
             return;
         }
         if self.float_mgr.handle_paste(text) {
+            return;
+        }
+        if self.sandbox_modal.is_open() && self.sandbox_modal.handle_paste(text) {
             return;
         }
         if self.search_modal.is_open() {

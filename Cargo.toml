@@ -24,6 +24,9 @@ maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
+maki-sandbox = { workspace = true }
+maki-interpreter = { workspace = true }
+mlua = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
@@ -38,6 +41,7 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
+futures = { workspace = true }
 open = { workspace = true }
 
 [dev-dependencies]
@@ -54,6 +58,7 @@ members = [
   "maki-lua",
   "maki-markdown",
   "maki-providers",
+  "maki-sandbox",
   "maki-storage",
   "maki-config-macro",
   "maki-lua-macro",
@@ -75,6 +80,7 @@ maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
+maki-sandbox = { path = "maki-sandbox" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
@@ -123,6 +129,7 @@ flume = { version = "0.11", default-features = false, features = ["async", "sele
 pin-project-lite = "0.2"
 rustix = { version = "1", default-features = false, features = ["process"] }
 humantime = "2"
+nix = { version = "0.29", default-features = false, features = ["sched", "mount", "fs", "process", "user", "signal", "poll"] }
 toml = "0.8"
 toml_edit = "0.22"
 smol = "2"

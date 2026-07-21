@@ -265,12 +265,17 @@ local function handler(input, ctx)
     end
   end
 
-  local result, err = maki.interpreter.run(PREAMBLE .. input.code, {
+  local run_opts = {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
     on_output = show,
     tools = tools,
-  })
+  }
+  if config.sandbox_enabled then
+    run_opts.workspace_dir = maki.uv.cwd() or "."
+    run_opts.sandbox_allowed_env = config.sandbox_allowed_env or {}
+  end
+  local result, err = maki.interpreter.run(PREAMBLE .. input.code, run_opts)
 
   if err then
     if err == CANCELLED_ERR then

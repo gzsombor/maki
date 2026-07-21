@@ -116,6 +116,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
+| `sandbox_enabled` | bool | `false` | - | Run code execution in a sandboxed child process with namespace isolation |
 
 ### `provider`
 
