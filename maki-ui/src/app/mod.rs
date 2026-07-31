@@ -625,12 +625,22 @@ impl App {
             self.active_chat().scroll(-half);
             return Some(vec![]);
         }
-        if key::SCROLL_TOP.matches(key) {
+        if key::SCROLL_TOP.matches(key) || key::SCROLL_START.matches(key) {
             self.active_chat().scroll_to_top();
             return Some(vec![]);
         }
-        if key::SCROLL_BOTTOM.matches(key) {
+        if key::SCROLL_BOTTOM.matches(key) || key::SCROLL_END.matches(key) {
             self.active_chat().enable_auto_scroll();
+            return Some(vec![]);
+        }
+        if key::SCROLL_PAGE_UP.matches(key) {
+            let page = self.chats[self.active_chat].page();
+            self.active_chat().scroll(page);
+            return Some(vec![]);
+        }
+        if key::SCROLL_PAGE_DOWN.matches(key) {
+            let page = self.chats[self.active_chat].page();
+            self.active_chat().scroll(-page);
             return Some(vec![]);
         }
         None

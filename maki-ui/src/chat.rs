@@ -196,6 +196,10 @@ impl Chat {
         self.messages_panel.half_page()
     }
 
+    pub fn page(&self) -> i32 {
+        self.messages_panel.page()
+    }
+
     pub fn win_view(&self) -> WinView {
         self.messages_panel.win_view()
     }
