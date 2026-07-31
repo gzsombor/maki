@@ -586,6 +586,10 @@ impl MessagesPanel {
         self.viewport_height as i32 / 2
     }
 
+    pub fn page(&self) -> i32 {
+        self.viewport_height as i32
+    }
+
     pub fn set_accent(&mut self, color: ratatui::style::Color) {
         self.accent.set(color);
     }

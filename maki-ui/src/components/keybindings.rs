@@ -136,6 +136,26 @@ pub mod key {
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e');
     pub const SCROLL_TOP: Bind = ctrl_bind!('g');
     pub const SCROLL_BOTTOM: Bind = ctrl_bind!('b');
+    pub const SCROLL_PAGE_UP: Bind = Bind {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+PageUp",
+    };
+    pub const SCROLL_PAGE_DOWN: Bind = Bind {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+PageDown",
+    };
+    pub const SCROLL_START: Bind = Bind {
+        code: KeyCode::Home,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+Home",
+    };
+    pub const SCROLL_END: Bind = Bind {
+        code: KeyCode::End,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+End",
+    };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
@@ -423,6 +443,18 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
         description: "Scroll half page up / down",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
+        description: "Scroll page up / down",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_START.label, key::SCROLL_END.label),
+        description: "Scroll to top / bottom",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },

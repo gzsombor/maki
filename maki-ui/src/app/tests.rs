@@ -1389,6 +1389,56 @@ fn scroll_shortcuts_toggle_auto_scroll() {
 }
 
 #[test]
+fn ctrl_home_end_scroll_shortcuts() {
+    let mut app = test_app();
+    app.active_chat().enable_auto_scroll();
+    app.update(Msg::Key(kb::SCROLL_START.to_key_event()));
+    assert!(!app.chats[0].auto_scroll());
+    app.update(Msg::Key(kb::SCROLL_END.to_key_event()));
+    assert!(app.chats[0].auto_scroll());
+}
+
+#[test]
+fn ctrl_page_up_down_scrolls_chat() {
+    let mut app = test_app();
+    for i in 0..50 {
+        app.active_chat()
+            .push(DisplayMessage::new(DisplayRole::User, format!("line {i}")));
+    }
+
+    let area = Rect::new(0, 0, 80, 20);
+    set_zone(&mut app, SelectionZone::Messages, area);
+
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.active_chat().view(frame, area, false);
+        })
+        .unwrap();
+
+    let max_scroll = app.active_chat().scroll_top();
+    assert!(
+        max_scroll > 0,
+        "scroll_top should be non-zero after rendering scrollable content"
+    );
+
+    app.update(Msg::Key(kb::SCROLL_PAGE_UP.to_key_event()));
+    assert!(
+        app.active_chat().scroll_top() < max_scroll,
+        "page up should scroll toward the top"
+    );
+    assert!(!app.chats[0].auto_scroll());
+
+    app.update(Msg::Key(kb::SCROLL_PAGE_DOWN.to_key_event()));
+    assert_eq!(
+        app.active_chat().scroll_top(),
+        max_scroll,
+        "page down should return to the bottom"
+    );
+}
+
+#[test]
 fn mouse_drag_updates_selection() {
     let mut app = test_app();
     set_zone(&mut app, SelectionZone::Messages, Rect::new(0, 0, 80, 20));

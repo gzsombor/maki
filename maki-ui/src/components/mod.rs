@@ -162,6 +162,16 @@ impl ModalScroll {
                 self.auto_scroll = true;
                 self.offset = self.max_offset;
             }
+            _ if key::SCROLL_PAGE_UP.matches(key_event) => self.scroll(self.page()),
+            _ if key::SCROLL_PAGE_DOWN.matches(key_event) => self.scroll(-self.page()),
+            _ if key::SCROLL_START.matches(key_event) => {
+                self.offset = 0;
+                self.auto_scroll = false;
+            }
+            _ if key::SCROLL_END.matches(key_event) => {
+                self.auto_scroll = true;
+                self.offset = self.max_offset;
+            }
             _ => return false,
         }
         true
@@ -169,6 +179,10 @@ impl ModalScroll {
 
     fn half_page(&self) -> i32 {
         (self.viewport_h / 2).max(1) as i32
+    }
+
+    fn page(&self) -> i32 {
+        self.viewport_h.max(1) as i32
     }
 
     fn clamp(&mut self) {
