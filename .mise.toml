@@ -1,0 +1,4 @@
+[tools]
+"github:JohnnyMorganz/StyLua" = "latest"
+"github:astral-sh/ruff" = "latest"
+"github:astral-sh/ty" = "latest"
