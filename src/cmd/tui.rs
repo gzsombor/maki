@@ -32,6 +32,7 @@ struct Stack {
     commands: Vec<CustomCommand>,
     model: Model,
     needs_login: bool,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
     sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
@@ -96,11 +97,18 @@ fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
     if cli.sandbox {
         maki_sandbox::namespace::probe()
             .map_err(|e| color_eyre::eyre::eyre!("{e}"))
             .context("sandbox preflight check failed -- cannot start with --sandbox")?;
         config.agent.sandbox_enabled = true;
+    }
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    if cli.sandbox {
+        return Err(color_eyre::eyre::eyre!(
+            "--sandbox is only supported on Linux"
+        ));
     }
     if !cli.allowed_tools.is_empty() {
         config.agent.allowed_tools = cli
@@ -166,6 +174,7 @@ fn build_stack(
         }
     }
 
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
     let sandbox = if config.agent.sandbox_enabled {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let workspace_name = cwd
@@ -216,6 +225,7 @@ fn build_stack(
             commands,
             model,
             needs_login,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
             sandbox,
         },
         warnings,
@@ -378,6 +388,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
                 sandbox: stack.sandbox.as_ref().map(Arc::clone),
             },
             initial_prompt.take(),

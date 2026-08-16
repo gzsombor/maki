@@ -18,6 +18,8 @@ pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
 pub(crate) mod rewind_picker;
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+#[path = "sandbox_modal.rs"]
 pub(crate) mod sandbox_modal;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
@@ -140,6 +142,9 @@ impl ModalScroll {
         }
     }
 
+    /// Used only by the sandbox modal, which is compiled out when the
+    /// `sandbox` feature is unavailable.
+    #[allow(dead_code)]
     pub fn scroll_to_bottom(&mut self) {
         self.auto_scroll = true;
         self.offset = self.max_offset;

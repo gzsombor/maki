@@ -1,3 +1,5 @@
+#![cfg(all(feature = "sandbox", target_os = "linux"))]
+
 use maki_sandbox::ipc::SetupMessage;
 use maki_sandbox::namespace::NamespaceConfig;
 use std::path::PathBuf;
@@ -8,7 +10,6 @@ use std::path::PathBuf;
 /// Needs `/proc/sys/kernel/unprivileged_userns_clone=1` on most distros,
 /// or `kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu.
 #[test]
-#[cfg(target_os = "linux")]
 fn sandbox_browser_listing() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let root = dir.path();

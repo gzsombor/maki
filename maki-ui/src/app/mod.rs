@@ -40,6 +40,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
 use crate::components::sandbox_modal::SandboxModal;
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -228,6 +229,7 @@ pub struct App {
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
     pub(super) sandbox_modal: SandboxModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
@@ -323,6 +325,7 @@ impl App {
             btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
             sandbox_modal: SandboxModal::new(
                 crate::components::sandbox_modal::SandboxInfo {
                     enabled: false,
@@ -516,6 +519,7 @@ impl App {
             self.usage_modal.scroll(delta);
             return None;
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
         if self.sandbox_modal.is_open() {
             self.sandbox_modal.scroll(delta);
             return None;
@@ -596,6 +600,7 @@ impl App {
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
         if key::SANDBOX.matches(key) {
             self.sandbox_modal.toggle();
             return Some(vec![]);
@@ -723,11 +728,12 @@ impl App {
             });
         }
 
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
         if self.sandbox_modal.is_open() {
             self.sandbox_modal.handle_key(key);
             if self.sandbox_modal.take_enabled_changed() {
                 let enabled = self.sandbox_modal.is_enabled();
-                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
                 if let Err(e) = maki_config::save_sandbox_enabled(&cwd, enabled) {
                     self.status_bar
                         .flash(format!("failed to save sandbox setting: {e}"));
@@ -1509,6 +1515,7 @@ impl App {
             }
             "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
             "/sandbox" => {
                 self.sandbox_modal.toggle();
                 vec![]
@@ -1643,13 +1650,20 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    const OVERLAY_COUNT: usize = if cfg!(all(feature = "sandbox", target_os = "linux")) {
+        14
+    } else {
+        13
+    };
+
+    fn overlays(&self) -> [&dyn Overlay; Self::OVERLAY_COUNT] {
         [
             &self.help_modal,
             &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
             &self.sandbox_modal,
             &self.file_picker,
             &self.task_picker,
@@ -1662,13 +1676,14 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; Self::OVERLAY_COUNT] {
         [
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
             &mut self.sandbox_modal,
             &mut self.file_picker,
             &mut self.task_picker,
@@ -1817,6 +1832,7 @@ impl App {
         if self.float_mgr.handle_paste(text) {
             return;
         }
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
         if self.sandbox_modal.is_open() && self.sandbox_modal.handle_paste(text) {
             return;
         }

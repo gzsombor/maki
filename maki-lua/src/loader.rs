@@ -449,9 +449,8 @@ impl PluginHost {
         self.inner.ui_action_rx.clone()
     }
 
-    pub fn set_sandbox_config(&self, runner: Arc<SandboxRunner>) -> Result<(), PluginError>{
-        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxConfig(runner))
-        {
+    pub fn set_sandbox_config(&self, runner: Arc<SandboxRunner>) -> Result<(), PluginError> {
+        if let Err(e) = self.inner.tx.try_send(Request::SetSandboxConfig(runner)) {
             tracing::warn!("failed to send sandbox config to lua runtime: {e}");
             Err(PluginError::HostDead)
         } else {

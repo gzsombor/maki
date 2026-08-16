@@ -2,6 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use maki_agent::AgentConfig;
 use maki_sandbox::Sandbox;
 use maki_sandbox::namespace::{EnvEntry, NamespaceConfig};
 use maki_sandbox::profiles::{self, MountUsage, SandboxProfile};
@@ -335,6 +336,52 @@ impl SandboxModal {
             spawn_error: None,
             enabled_changed: false,
         }
+    }
+
+    /// Build the modal from the agent config, deriving the namespace
+    /// layout (mounts, env) shown on the info tab.
+    pub fn from_config(config: &AgentConfig, sandbox: Option<Arc<Sandbox>>) -> Self {
+        let workspace_dir = std::env::current_dir().ok();
+        let workspace_name = workspace_dir
+            .as_ref()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let ns_config = NamespaceConfig::from_agent_config(
+            config.sandbox_allowed_env.clone(),
+            &config.sandbox_allowed_paths,
+            &config.sandbox_extra_dirs,
+            workspace_dir.clone().unwrap_or_default(),
+            workspace_name.clone(),
+        );
+        let home_mounts: Vec<(String, String)> = ns_config
+            .home_mounts
+            .iter()
+            .map(|(p, name)| (p.display().to_string(), name.clone()))
+            .collect();
+        let extra_workspace_dirs: Vec<(String, String)> = ns_config
+            .extra_workspace_dirs
+            .iter()
+            .map(|(p, name)| (p.display().to_string(), name.clone()))
+            .collect();
+        let env_entries = ns_config.effective_env();
+        Self::new(
+            SandboxInfo {
+                enabled: config.sandbox_enabled,
+                env_entries,
+                workspace_dir: workspace_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                workspace_name,
+                home_mounts,
+                profiles: profiles::builtin_profiles()
+                    .into_iter()
+                    .map(|p| (p, false))
+                    .collect(),
+                extra_workspace_dirs,
+            },
+            sandbox,
+        )
     }
 
     pub fn is_open(&self) -> bool {

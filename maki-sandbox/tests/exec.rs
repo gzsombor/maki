@@ -1,3 +1,5 @@
+#![cfg(all(feature = "sandbox", target_os = "linux"))]
+
 use maki_sandbox::ipc::SetupMessage;
 use maki_sandbox::namespace::NamespaceConfig;
 use std::path::PathBuf;
@@ -7,7 +9,6 @@ const EXEC_FAILED: &str = "exec failed";
 /// Test that a sandbox browser can execute shell commands via Exec IPC.
 /// This requires user namespace support (CLONE_NEWUSER).
 #[test]
-#[cfg(target_os = "linux")]
 fn sandbox_shell_exec() {
     let dir = tempfile::TempDir::new().expect("temp dir");
 

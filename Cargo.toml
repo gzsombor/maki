@@ -24,7 +24,7 @@ maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
-maki-sandbox = { workspace = true }
+maki-sandbox = { workspace = true, optional = true }
 maki-interpreter = { workspace = true }
 mlua = { workspace = true }
 clap = { workspace = true }
@@ -43,6 +43,10 @@ uuid = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
 open = { workspace = true }
+
+[features]
+default = ["sandbox"]
+sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox", "maki-ui/sandbox"]
 
 [dev-dependencies]
 test-case = { workspace = true }

@@ -84,6 +84,7 @@ pub struct EventLoopParams {
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
     pub sandbox: Option<Arc<maki_sandbox::Sandbox>>,
 }
 
@@ -490,6 +491,7 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             lua_event_handle,
             model_policy,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
             sandbox,
         } = params;
 
@@ -569,47 +571,11 @@ impl<'t> EventLoop<'t> {
         }
 
         // Initialize sandbox info from agent config.
-        let workspace_dir = std::env::current_dir().ok();
-        let workspace_name = workspace_dir
-            .as_ref()
-            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_default();
-        let ns_config = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
-            ctx.config.sandbox_allowed_env.clone(),
-            &ctx.config.sandbox_allowed_paths,
-            &ctx.config.sandbox_extra_dirs,
-            workspace_dir.clone().unwrap_or_default(),
-            workspace_name.clone(),
-        );
-        let home_mounts: Vec<(String, String)> = ns_config
-            .home_mounts
-            .iter()
-            .map(|(p, name)| (p.display().to_string(), name.clone()))
-            .collect();
-        let extra_workspace_dirs: Vec<(String, String)> = ns_config
-            .extra_workspace_dirs
-            .iter()
-            .map(|(p, name)| (p.display().to_string(), name.clone()))
-            .collect();
-        let env_entries = ns_config.effective_env();
-        app.sandbox_modal = crate::components::sandbox_modal::SandboxModal::new(
-            crate::components::sandbox_modal::SandboxInfo {
-                enabled: ctx.config.sandbox_enabled,
-                env_entries,
-                workspace_dir: workspace_dir
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-                workspace_name,
-                home_mounts,
-                profiles: maki_sandbox::profiles::builtin_profiles()
-                    .into_iter()
-                    .map(|p| (p, false))
-                    .collect(),
-                extra_workspace_dirs,
-            },
-            sandbox,
-        );
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        {
+            app.sandbox_modal =
+                crate::components::sandbox_modal::SandboxModal::from_config(&ctx.config, sandbox);
+        }
 
         for w in startup_warnings {
             app.flash(w);

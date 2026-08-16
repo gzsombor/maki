@@ -1,3 +1,5 @@
+#![cfg(all(feature = "sandbox", target_os = "linux"))]
+
 pub mod child;
 pub mod error;
 pub mod ipc;
