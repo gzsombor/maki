@@ -22,7 +22,7 @@ mod sandbox_impl {
     use nix::sys::wait::WaitStatus;
     use nix::unistd::ForkResult;
 
-    fn main() {
+    pub fn main() {
         let ws_dir = std::env::current_dir().expect("cwd");
         let ws_name = ws_dir
             .file_name()

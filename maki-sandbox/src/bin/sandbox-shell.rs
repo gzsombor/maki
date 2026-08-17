@@ -43,7 +43,7 @@ mod sandbox_impl {
         eprintln!("  sandbox-shell -x -p rust . cargo build # build in sandbox, then exit");
     }
 
-    fn main() {
+    pub fn main() {
         // Handle --sandbox-inner (called by child_main after pivot_root)
         if std::env::args().nth(1).as_deref() == Some("--sandbox-inner") {
             maki_sandbox::child::child_inner_main();

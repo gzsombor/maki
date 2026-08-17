@@ -4,7 +4,7 @@ use std::process::Command;
 use include_dir::{Dir, include_dir};
 use mlua::prelude::*;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 static EMBEDDED_PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../plugins");
 
@@ -42,6 +42,8 @@ impl ChildLuaRuntime {
             .get(name)
             .map_err(|e| format!("tool '{name}' not found: {e}"))?;
 
+        info!(name = %name, ?args, ?kwargs, "call_tool");
+
         let input = build_tool_input(args, kwargs);
         let input_lua = json_to_lua(&self.lua, &input).map_err(|e| e.to_string())?;
 
@@ -49,6 +51,7 @@ impl ChildLuaRuntime {
             .call(input_lua)
             .map_err(|e| format!("{name}: {e}"))?;
 
+        info!(?values, "call_tool_result");
         extract_tool_result(values)
     }
 
