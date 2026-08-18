@@ -146,11 +146,7 @@ mod sandbox_impl {
             }
         };
 
-        if let Err(e) = sandbox.setup(&maki_sandbox::ipc::SetupMessage {
-            code: String::new(),
-            timeout_secs: 0,
-            max_memory: 0,
-        }) {
+        if let Err(e) = sandbox.setup(&maki_sandbox::ipc::SetupMessage::browse()) {
             eprintln!("setup failed: {e}");
             std::process::exit(1);
         }

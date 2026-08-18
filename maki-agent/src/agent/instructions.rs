@@ -57,11 +57,17 @@ pub fn build_system_prompt(
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
     model: &Model,
+    sandbox_cwd: Option<&str>,
 ) -> String {
     let env = vars.apply(
         "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
     );
-    let env = format!("{env}\n- Model: {}", model.spec());
+    let mut env = format!("{env}\n- Model: {}", model.spec());
+    if let Some(sandbox_cwd) = sandbox_cwd {
+        env.push_str(&format!(
+            "\n- Sandbox: code_execution runs at {sandbox_cwd} (a sandboxed copy of the working directory). Use that path space (or relative paths) inside code_execution; all other tools use the host working directory above."
+        ));
+    }
     let instructions = format!("{env}{instructions}");
     let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 
@@ -227,10 +233,25 @@ mod tests {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let slots = crate::prompt::ResolvedSlots::default();
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let prompt = build_system_prompt(&vars, mode, "", &slots, &model);
+        let prompt = build_system_prompt(&vars, mode, "", &slots, &model, None);
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
+        }
+    }
+
+    #[test_case(None, false ; "no_sandbox_omits_note")]
+    #[test_case(Some("/home/maki/workspace/maki"), true ; "sandbox_adds_note")]
+    fn sandbox_note_presence(sandbox_cwd: Option<&str>, expect_note: bool) {
+        let vars = Vars::new()
+            .set("{cwd}", "/host/maki")
+            .set("{platform}", "linux");
+        let slots = crate::prompt::ResolvedSlots::default();
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let prompt = build_system_prompt(&vars, &AgentMode::Build, "", &slots, &model, sandbox_cwd);
+        assert_eq!(prompt.contains("code_execution runs at"), expect_note);
+        if let Some(cwd) = sandbox_cwd {
+            assert!(prompt.contains(cwd));
         }
     }
 
@@ -255,6 +276,7 @@ mod tests {
             &format!("\n{INSTR}"),
             &slots,
             &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
+            None,
         );
         let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
         assert!(

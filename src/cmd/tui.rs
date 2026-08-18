@@ -190,11 +190,14 @@ fn build_stack(
         );
         let sandbox = maki_sandbox::Sandbox::new(ns_config).context("initialize sandbox")?;
         let sandbox_for_runner = Arc::clone(&sandbox);
+        let config_json = serde_json::to_string(&config.agent)?;
         let runner: std::sync::Arc<maki_lua::SandboxRunner> =
             std::sync::Arc::new(move |lua, code, timeout, fns| {
                 let sandbox = Arc::clone(&sandbox_for_runner);
+                let config_json = config_json.clone();
                 Box::pin(async move {
-                    crate::sandbox::run_sandbox_with(&sandbox, lua, code, timeout, fns).await
+                    crate::sandbox::run_sandbox_with(&sandbox, lua, code, timeout, fns, config_json)
+                        .await
                 })
             });
         plugin_host.set_sandbox_config(runner).ok().map(|_| sandbox)

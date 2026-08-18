@@ -213,11 +213,7 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let _ = sandbox.setup(&SetupMessage {
-            code: String::new(),
-            timeout_secs: 0,
-            max_memory: 0,
-        });
+        let _ = sandbox.setup(&SetupMessage::browse());
         let pwd = match sandbox.pwd() {
             Ok(p) => p,
             Err(_) => {
@@ -234,11 +230,7 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let _ = sandbox.setup(&SetupMessage {
-            code: String::new(),
-            timeout_secs: 0,
-            max_memory: 0,
-        });
+        let _ = sandbox.setup(&SetupMessage::browse());
         let (output, is_error) = match sandbox.exec("echo hello") {
             Ok(r) => r,
             Err(_) => {
@@ -272,11 +264,7 @@ mod tests {
                 return;
             }
         };
-        let _ = sandbox.setup(&SetupMessage {
-            code: String::new(),
-            timeout_secs: 0,
-            max_memory: 0,
-        });
+        let _ = sandbox.setup(&SetupMessage::browse());
         let entries = match sandbox.ls(".") {
             Ok(e) => e,
             Err(_) => {
@@ -294,11 +282,7 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let _ = sandbox.setup(&SetupMessage {
-            code: String::new(),
-            timeout_secs: 0,
-            max_memory: 0,
-        });
+        let _ = sandbox.setup(&SetupMessage::browse());
         let _ = sandbox.exit();
     }
 
@@ -309,13 +293,7 @@ mod tests {
             return;
         };
         drop(sandbox.inner.lock().unwrap().take());
-        let err = sandbox
-            .setup(&SetupMessage {
-                code: String::new(),
-                timeout_secs: 0,
-                max_memory: 0,
-            })
-            .unwrap_err();
+        let err = sandbox.setup(&SetupMessage::browse()).unwrap_err();
         assert!(err.to_string().contains("not initialized"));
     }
 }

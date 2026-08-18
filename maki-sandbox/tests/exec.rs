@@ -27,11 +27,7 @@ fn sandbox_shell_exec() {
     let sandbox = maki_sandbox::Sandbox::new(config)
         .expect("Sandbox::new should succeed (may need user namespace support)");
     sandbox
-        .setup(&SetupMessage {
-            code: String::new(),
-            timeout_secs: 0,
-            max_memory: 0,
-        })
+        .setup(&SetupMessage::browse())
         .expect("setup should succeed");
 
     let pwd = sandbox.pwd().expect("pwd should succeed");

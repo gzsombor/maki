@@ -68,11 +68,7 @@ mod sandbox_impl {
             }
         };
         sandbox
-            .setup(&maki_sandbox::ipc::SetupMessage {
-                code: String::new(),
-                timeout_secs: 0,
-                max_memory: 0,
-            })
+            .setup(&maki_sandbox::ipc::SetupMessage::browse())
             .unwrap_or_else(|e| {
                 eprintln!("  setup FAILED: {e}");
                 std::process::exit(1);

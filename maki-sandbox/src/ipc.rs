@@ -64,6 +64,20 @@ pub struct SetupMessage {
     pub code: String,
     pub timeout_secs: u64,
     pub max_memory: usize,
+    /// Serialized `AgentConfig` JSON; the child builds its tool ctx from it.
+    pub config: String,
+}
+
+impl SetupMessage {
+    /// Browse-mode setup: no code, no limits, no config.
+    pub const fn browse() -> Self {
+        Self {
+            code: String::new(),
+            timeout_secs: 0,
+            max_memory: 0,
+            config: String::new(),
+        }
+    }
 }
 
 pub fn send_setup(sock: &mut UnixStream, msg: &SetupMessage) -> Result<(), SandboxError> {
@@ -392,12 +406,14 @@ mod tests {
             code: "print('hello')".into(),
             timeout_secs: 30,
             max_memory: 1024,
+            config: "{}".into(),
         };
         send_setup(&mut tx, &msg).unwrap();
         let got = recv_setup(&mut rx).unwrap();
         assert_eq!(got.code, "print('hello')");
         assert_eq!(got.timeout_secs, 30);
         assert_eq!(got.max_memory, 1024);
+        assert_eq!(got.config, "{}");
     }
 
     #[test]

@@ -2800,6 +2800,7 @@ version = "0.4.11"
 dependencies = [
  "include_dir",
  "libc",
+ "maki-agent",
  "maki-interpreter",
  "mlua",
  "nix",

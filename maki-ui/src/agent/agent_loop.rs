@@ -1,3 +1,5 @@
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -239,6 +241,7 @@ impl AgentLoop {
             &self.instructions.text,
             &prompt_slots,
             &slot.model,
+            self.sandbox_cwd().as_deref(),
         );
         self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
@@ -310,6 +313,26 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
+    /// The working directory the sandboxed `code_execution` child sees, when the
+    /// sandbox is active. `None` otherwise, so the system prompt omits the note.
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        if !self.config.sandbox_enabled {
+            return None;
+        }
+        let host_cwd = self.vars.apply("{cwd}").into_owned();
+        let workspace_name = Path::new(&host_cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(format!("/home/maki/workspace/{workspace_name}"))
+    }
+
+    #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
+    fn sandbox_cwd(&self) -> Option<String> {
+        None
+    }
+
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
     /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
@@ -320,6 +343,7 @@ impl AgentLoop {
             &self.instructions.text,
             prompt_slots,
             &slot.model,
+            self.sandbox_cwd().as_deref(),
         );
         self.btw_system.store(Arc::new(system));
     }

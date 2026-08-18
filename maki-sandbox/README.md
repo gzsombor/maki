@@ -4,7 +4,7 @@ Linux namespace-based sandbox for running untrusted code with filesystem isolati
 
 ## Overview
 
-When `sandbox_enabled = true`, code execution runs inside a child process with user and mount namespaces. The child has a minimal, read-only root filesystem built from the host's `/usr`, `/lib`, and `/dev`, with only the workspace directory writable. Filesystem tools (read, write, edit, glob, grep) run inside the child via a minimal Lua runtime that loads the existing plugins. Only trusted tools (network, UI, agent state) are forwarded to the parent over IPC.
+When `sandbox_enabled = true`, code execution runs inside a child process with user and mount namespaces. The child has a minimal, read-only root filesystem built from the host's `/usr`, `/lib`, and `/dev`, with only the workspace directory writable. Filesystem tools (read, write, edit, multiedit, glob, grep, list) run inside the child via a minimal Lua runtime that loads the existing plugins, and `bash` runs inside the child via `fork()+execve()`. Only trusted tools (network, UI, agent state) are forwarded to the parent over IPC.
 
 ## Process model
 
@@ -122,22 +122,38 @@ The child's environment is wiped (`clearenv`) and rebuilt from scratch. Only the
 
 Tools split into two categories:
 
-- **Sandbox-local tools** (`read`, `write`, `edit`, `multiedit`, `glob`, `grep`) -- run inside the child via the `ChildLuaRuntime`. The Lua plugins are embedded in the binary at compile time (via `include_dir!`), so no host filesystem mount is needed. Filesystem operations are naturally sandboxed by the mount namespace. `bash` runs inside the child via `fork()+execve()`.
+- **Sandbox-local tools** (`read`, `write`, `edit`, `multiedit`, `glob`, `grep`, `list`) -- run inside the child via the `ChildLuaRuntime`. The Lua plugins are embedded in the binary at compile time (via `include_dir!`), so no host filesystem mount is needed. Filesystem operations are naturally sandboxed by the mount namespace. `bash` runs inside the child via `fork()+execve()`.
 - **Trusted tools** (`webfetch`, `websearch`, `question`, `todo_write`, `task`, `memory`, `skill`, `index`) -- forwarded to the parent via IPC. These require host resources (network, UI, tree-sitter grammars) not available in the sandbox.
 
 ### Child Lua Runtime
 
 The `ChildLuaRuntime` (`lua_runtime.rs`) provides a minimal `maki.*` API surface:
-- `maki.fs.*` -- filesystem operations (sandboxed by mount namespace)
+- `maki.fs.*` -- filesystem operations (sandboxed by mount namespace); `grep` is implemented (not stubbed)
 - `maki.uv.*` -- cwd, os_homedir, os_getenv
-- `maki.fn.*` -- synchronous process execution
+- `maki.fn.*` -- synchronous process execution (jobstart, jobwait, jobstop)
 - `maki.json.*` -- encode/decode
 - `maki.log.*` -- structured logging
 - `maki.split` -- string splitting
 - `maki.ui.*` -- stubs (no terminal in sandbox)
 - `maki.api.register_tool` -- tool registration
+- `maki.api.register_options` -- returns the merged resolved option defaults
+- `maki.treesitter.*` -- stubs
+- `maki.async.run` -- runs inline (no async in child)
 
 Plugins are loaded from the embedded static (`include_dir!("$CARGO_MANIFEST_DIR/../plugins")`). If a filesystem plugin directory exists at the expected path (useful for development), it is used instead. The `require()` function resolves modules from the plugin directory's `lib/` subdirectory or from the embedded sources.
+
+#### Tool context (`ctx`)
+
+Lua tool handlers receive `(input, ctx)`, where `ctx` is a `UserData` exposing the per-tool state the plugins expect:
+
+- `ctx:config(key, default)` -- reads the serialized `AgentConfig` (passed from the parent via `SetupMessage.config`)
+- `ctx:tool_output_lines()` -- per-tool output line limits
+- `ctx:record_read(path)` -- track files read
+- `ctx:check_before_edit(path)` -- stale-read check before edits
+- `ctx:is_instruction_file(name)` -- instruction-file detection
+- `ctx:find_instructions(dir)` -- locate AGENTS.md files (returns `[{path, content}]`)
+
+The `FileReadTracker` is fresh in the child (safe: `check_before_edit` allows untracked files), so no parent state is seeded.
 
 ## Public API
 
@@ -154,6 +170,8 @@ sandbox.reinit(new_config)?;                    // tear down + respawn
 sandbox.exit()?;                                // send exit signal
 // child is waited on when Sandbox is dropped
 ```
+
+`SetupMessage` carries `code` (empty string = browse mode), `timeout_secs`, `max_memory`, and `config` (the serialized `AgentConfig` JSON the child builds its tool `ctx` from). Browse-mode setups use `SetupMessage::browse()`.
 
 All IPC is serialized through an internal mutex. `reinit` tears down the old child (sends `Exit`, waits) before spawning a new one.
 
@@ -182,6 +200,6 @@ Use `profiles::build_namespace_config()` to convert enabled profiles into a `Nam
 - `src/namespace.rs` -- tests for env computation, path building, linker detection
 - `src/profiles.rs` -- tests for path resolution, profile-to-config conversion
 - `src/sandbox.rs` -- integration tests for `Sandbox` lifecycle (require namespace support)
-- `src/lua_runtime.rs` -- unit tests for `ChildLuaRuntime` (plugin loading, tool registration, fs operations)
+- `src/lua_runtime.rs` -- unit tests for `ChildLuaRuntime` (plugin loading, tool registration, fs operations, embedded-plugin read/grep round-trips, tool `ctx` and `register_options`)
 - `tests/browse.rs` -- file browser integration test
 - `tests/exec.rs` -- shell execution integration test

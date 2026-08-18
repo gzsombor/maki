@@ -1,12 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use include_dir::{Dir, include_dir};
+use maki_agent::tools::{FileReadTracker, grep as grep_tool};
+use maki_agent::{LoadedInstructions, find_subdirectory_instructions, is_instruction_file};
+use mlua::MultiValue;
 use mlua::prelude::*;
+use mlua::{UserData, UserDataMethods};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 static EMBEDDED_PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../plugins");
+
+/// Global name of the serialized `AgentConfig` table, if the parent sent one.
+const CONFIG_GLOBAL: &str = "_config";
 
 /// Minimal Lua runtime for the sandbox child.
 ///
@@ -16,15 +24,32 @@ static EMBEDDED_PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../plugins"
 /// see paths mounted inside the namespace.
 pub struct ChildLuaRuntime {
     lua: Lua,
+    tracker: Arc<FileReadTracker>,
+    instructions: LoadedInstructions,
 }
 
 impl ChildLuaRuntime {
-    pub fn new(plugin_dir: &Path) -> Result<Self, LuaError> {
+    /// `config_json` is the parent's serialized `AgentConfig`; the child's
+    /// tool ctx reads limits and toggles from it.
+    pub fn new(plugin_dir: &Path, config_json: Option<&str>) -> Result<Self, LuaError> {
         let lua = Lua::new();
         create_maki_api(&lua)?;
+        match config_json {
+            Some(json) => match serde_json::from_str::<Value>(json) {
+                Ok(value) => lua
+                    .globals()
+                    .set(CONFIG_GLOBAL, json_to_lua(&lua, &value)?)?,
+                Err(e) => warn!(error = %e, "lua_runtime: bad config json, defaults apply"),
+            },
+            None => debug!("lua_runtime: no config, defaults apply"),
+        }
         setup_require(&lua, plugin_dir.to_path_buf())?;
         load_plugins(&lua, plugin_dir)?;
-        Ok(Self { lua })
+        Ok(Self {
+            lua,
+            tracker: FileReadTracker::fresh(),
+            instructions: LoadedInstructions::new(),
+        })
     }
 
     /// Call a registered tool by name.
@@ -46,9 +71,11 @@ impl ChildLuaRuntime {
 
         let input = build_tool_input(args, kwargs);
         let input_lua = json_to_lua(&self.lua, &input).map_err(|e| e.to_string())?;
+        let ctx = build_ctx(&self.lua, &self.tracker, &self.instructions)
+            .map_err(|e| format!("{name}: build ctx: {e}"))?;
 
         let values: LuaMultiValue = handler
-            .call(input_lua)
+            .call((input_lua, ctx))
             .map_err(|e| format!("{name}: {e}"))?;
 
         info!(?values, "call_tool_result");
@@ -68,6 +95,108 @@ impl ChildLuaRuntime {
         }
         Ok(names)
     }
+}
+
+// ──────────────────────────────────────────────
+//  Tool ctx (input's second argument)
+// ──────────────────────────────────────────────
+
+fn config_table(lua: &Lua) -> LuaResult<LuaTable> {
+    match lua
+        .globals()
+        .get::<LuaValue>(CONFIG_GLOBAL)
+        .unwrap_or(LuaValue::Nil)
+    {
+        LuaValue::Table(t) => Ok(t),
+        _ => lua.create_table(),
+    }
+}
+
+/// Per-call ctx for the child: a userdata mirroring the subset of the
+/// parent `LuaCtx` surface the filesystem tools use: `config`,
+/// `tool_output_lines`, `record_read`, `check_before_edit`,
+/// `is_instruction_file`, `find_instructions`.
+struct ChildCtx {
+    tracker: Arc<FileReadTracker>,
+    instructions: LoadedInstructions,
+}
+
+impl UserData for ChildCtx {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("config", |lua, _this, args: MultiValue| {
+            let key: Option<LuaResult<String>> = (0..args.len())
+                .next()
+                .map(|_| lua.from_value::<String>(args[0].clone()));
+            let default = args.get(1).cloned().unwrap_or(LuaValue::Nil);
+            match key {
+                None => config_table(lua).map(LuaValue::Table),
+                Some(Ok(key)) => {
+                    let cfg = config_table(lua)?;
+                    let val = cfg.raw_get::<LuaValue>(key.as_str())?;
+                    Ok(if val.is_nil() { default } else { val })
+                }
+                Some(Err(e)) => Err(e),
+            }
+        });
+
+        methods.add_method("tool_output_lines", |lua, _this, ()| {
+            let cfg = config_table(lua)?;
+            cfg.raw_get::<LuaValue>("tool_output_lines")
+        });
+
+        methods.add_method("record_read", |_lua, this, path: String| {
+            this.tracker.record_read(Path::new(&path));
+            Ok(true)
+        });
+
+        methods.add_method("check_before_edit", |lua, this, path: String| {
+            let stale_check = {
+                let cfg = config_table(lua)?;
+                cfg.raw_get::<bool>("stale_read_check")?
+            };
+            if !stale_check {
+                return Ok((true, LuaValue::Nil));
+            }
+            match this.tracker.check_before_edit(Path::new(&path)) {
+                Ok(()) => Ok((true, LuaValue::Nil)),
+                Err(msg) => Ok((false, LuaValue::String(lua.create_string(msg.as_str())?))),
+            }
+        });
+
+        methods.add_method("is_instruction_file", |_lua, _this, name: String| {
+            Ok(is_instruction_file(&name))
+        });
+
+        methods.add_method("find_instructions", |lua, this, dir_path: String| {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let abs = if Path::new(&dir_path).is_absolute() {
+                PathBuf::from(&dir_path)
+            } else {
+                cwd.join(&dir_path)
+            };
+            let results = find_subdirectory_instructions(&abs, &cwd, &this.instructions);
+            let tbl = lua.create_table()?;
+            for (i, (path, content)) in results.into_iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("path", path)?;
+                entry.set("content", content)?;
+                tbl.set(i + 1, entry)?;
+            }
+            Ok(tbl)
+        });
+    }
+}
+
+fn build_ctx(
+    lua: &Lua,
+    tracker: &Arc<FileReadTracker>,
+    instructions: &LoadedInstructions,
+) -> LuaResult<LuaValue> {
+    let ud = lua.create_userdata(ChildCtx {
+        tracker: tracker.clone(),
+        instructions: instructions.clone(),
+    })?;
+    Ok(LuaValue::UserData(ud))
 }
 
 // ──────────────────────────────────────────────
@@ -166,11 +295,20 @@ fn create_maki_api(lua: &Lua) -> Result<(), LuaError> {
 // ──────────────────────────────────────────────
 
 fn setup_require(lua: &Lua, plugin_dir: PathBuf) -> Result<(), LuaError> {
-    lua.globals().set(
-        "require",
-        lua.create_function(move |lua, name: String| resolve_require(lua, &plugin_dir, &name))?,
-    )?;
+    let global_require = create_require_fn(lua, &plugin_dir, None)?;
+    lua.globals().set("require", global_require)?;
     Ok(())
+}
+
+/// Build a `require` function. When `base` is set, plugin-local modules
+/// (`{base}/foo.lua`) are resolved after the shared `lib/` modules, matching
+/// the parent runtime's precedence.
+fn create_require_fn(lua: &Lua, plugin_dir: &Path, base: Option<&str>) -> LuaResult<LuaFunction> {
+    let plugin_dir = plugin_dir.to_path_buf();
+    let base = base.map(str::to_string);
+    lua.create_function(move |lua, name: String| {
+        resolve_require(lua, &plugin_dir, base.as_deref(), &name)
+    })
 }
 
 fn read_embedded_file(rel: &str) -> Option<String> {
@@ -180,7 +318,12 @@ fn read_embedded_file(rel: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn resolve_require(lua: &Lua, plugin_dir: &Path, modname: &str) -> LuaResult<LuaValue> {
+fn resolve_require(
+    lua: &Lua,
+    plugin_dir: &Path,
+    base: Option<&str>,
+    modname: &str,
+) -> LuaResult<LuaValue> {
     let loaded: LuaTable = lua.globals().get("_loaded")?;
     if let Ok(val) = loaded.get::<LuaValue>(modname)
         && !val.is_nil()
@@ -189,11 +332,11 @@ fn resolve_require(lua: &Lua, plugin_dir: &Path, modname: &str) -> LuaResult<Lua
     }
 
     let rel = modname.replace('.', "/");
-    let candidates = [
-        format!("{rel}.lua"),
-        format!("lib/{rel}.lua"),
-        format!("lib/{rel}/init.lua"),
-    ];
+    let mut candidates = vec![format!("lib/{rel}.lua"), format!("lib/{rel}/init.lua")];
+    if let Some(base) = base {
+        candidates.push(format!("{base}/{rel}.lua"));
+    }
+    candidates.push(format!("{rel}.lua"));
 
     for path in &candidates {
         // Try filesystem first, then embedded
@@ -285,8 +428,8 @@ fn load_plugins(lua: &Lua, plugin_dir: &Path) -> Result<(), LuaError> {
                     continue;
                 }
             }
-        } else if let Some(dir) = EMBEDDED_PLUGINS.get_dir(name) {
-            match dir.get_file("init.lua").and_then(|f| f.contents_utf8()) {
+        } else if let Some(file) = EMBEDDED_PLUGINS.get_file(format!("{name}/init.lua")) {
+            match file.contents_utf8() {
                 Some(s) => s.to_string(),
                 None => continue,
             }
@@ -300,7 +443,7 @@ fn load_plugins(lua: &Lua, plugin_dir: &Path) -> Result<(), LuaError> {
             let (k, v) = pair?;
             env.set(k, v)?;
         }
-        env.set("require", lua.globals().get::<LuaFunction>("require")?)?;
+        env.set("require", create_require_fn(lua, plugin_dir, Some(name))?)?;
         env.set("maki", lua.globals().get::<LuaValue>("maki")?)?;
 
         if let Err(e) = lua.load(&src).set_name(name).set_environment(env).exec() {
@@ -455,7 +598,8 @@ fn fs_basename(lua: &Lua, path: String) -> LuaResult<LuaValue> {
 }
 
 fn fs_abspath(lua: &Lua, path: String) -> LuaResult<LuaValue> {
-    let p = Path::new(&path);
+    let expanded = expand_home(&path);
+    let p = Path::new(&expanded);
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -466,6 +610,20 @@ fn fs_abspath(lua: &Lua, path: String) -> LuaResult<LuaValue> {
     Ok(LuaValue::String(
         lua.create_string(abs.to_string_lossy().as_bytes())?,
     ))
+}
+
+fn expand_home(path: &str) -> String {
+    match path {
+        "~" => std::env::var("HOME").unwrap_or_default(),
+        _ if path.starts_with("~/") => {
+            format!(
+                "{}{}",
+                std::env::var("HOME").unwrap_or_default(),
+                &path[1..]
+            )
+        }
+        other => other.to_string(),
+    }
 }
 
 fn fs_dir(lua: &Lua, path: String) -> LuaResult<LuaMultiValue> {
@@ -631,11 +789,62 @@ fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
 }
 
 fn fs_grep(lua: &Lua, (pattern, opts): (String, Option<LuaTable>)) -> LuaResult<LuaMultiValue> {
-    let _ = (pattern, opts);
-    // Grep is complex — return empty for now, parent handles it as trusted tool
+    let mut params = grep_tool::GrepParams::new(pattern);
+    if let Some(ref opts) = opts {
+        if let Ok(v) = opts.get::<String>("path") {
+            params.path = Some(expand_home(&v));
+        }
+        if let Ok(v) = opts.get::<String>("include") {
+            params.include = Some(v);
+        }
+        if let Ok(v) = opts.get::<usize>("context_before") {
+            params.context_before = v;
+        }
+        if let Ok(v) = opts.get::<usize>("context_after") {
+            params.context_after = v;
+        }
+        if let Ok(v) = opts.get::<usize>("limit") {
+            params.limit = v;
+        }
+        if let Ok(v) = opts.get::<usize>("max_line_bytes") {
+            params.max_line_bytes = v;
+        }
+    }
+
+    let (base, entries) = match grep_tool::grep_search(params) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(LuaMultiValue::from_vec(vec![
+                LuaValue::Nil,
+                LuaValue::String(lua.create_string(e.as_bytes())?),
+            ]));
+        }
+    };
+
+    let table = lua.create_table()?;
+    for (i, entry) in entries.iter().enumerate() {
+        let etbl = lua.create_table()?;
+        etbl.set("path", base.join(&entry.path).to_string_lossy().as_ref())?;
+        let groups_tbl = lua.create_table()?;
+        for (gi, group) in entry.groups.iter().enumerate() {
+            let gtbl = lua.create_table()?;
+            let lines_tbl = lua.create_table()?;
+            for (li, line) in group.lines.iter().enumerate() {
+                let ltbl = lua.create_table()?;
+                ltbl.set("line_nr", line.line_nr)?;
+                ltbl.set("text", line.text.as_str())?;
+                ltbl.set("is_match", line.is_match)?;
+                lines_tbl.set(li + 1, ltbl)?;
+            }
+            gtbl.set("lines", lines_tbl)?;
+            groups_tbl.set(gi + 1, gtbl)?;
+        }
+        etbl.set("groups", groups_tbl)?;
+        table.set(i + 1, etbl)?;
+    }
     Ok(LuaMultiValue::from_vec(vec![
+        LuaValue::Table(table),
         LuaValue::Nil,
-        LuaValue::String(lua.create_string(b"grep not available in sandbox child")?),
     ]))
 }
 
@@ -693,13 +902,13 @@ fn log_error(_: &Lua, msg: String) -> LuaResult<()> {
 
 fn ui_buf(lua: &Lua, _: ()) -> LuaResult<LuaValue> {
     let buf = lua.create_table()?;
+    let noop = lua.create_function(|_, _: LuaValue| Ok(LuaValue::Nil))?;
+    buf.set("line", noop)?;
+    let noop_multi = lua.create_function(|_, _: Vec<LuaValue>| Ok(LuaValue::Nil))?;
+    buf.set("on", noop_multi)?;
     buf.set(
-        "line",
-        lua.create_function(|_, _: LuaValue| Ok(LuaValue::Nil))?,
-    )?;
-    buf.set(
-        "on",
-        lua.create_function(|_, _: (LuaValue, LuaValue)| Ok(LuaValue::Nil))?,
+        "set_lines",
+        lua.create_function(|_, _: Vec<LuaValue>| Ok(LuaValue::Nil))?,
     )?;
     Ok(LuaValue::Table(buf))
 }
@@ -736,10 +945,21 @@ fn api_register_tool(lua: &Lua, spec: LuaTable) -> LuaResult<()> {
     Ok(())
 }
 
-fn api_register_options(_: &Lua, spec: LuaTable) -> LuaResult<LuaValue> {
-    // Build a table of default values from the spec
-    let result = LuaValue::Table(spec);
-    Ok(result)
+fn api_register_options(lua: &Lua, spec: LuaTable) -> LuaResult<LuaValue> {
+    // Return the resolved options table (defaults only — the child has no
+    // access to the user's `plugins.<name>` overrides), matching the
+    // parent contract where a key is absent when there is no default.
+    let merged = lua.create_table()?;
+    for pair in spec.pairs::<String, LuaValue>() {
+        let (name, val) = pair?;
+        if let LuaValue::Table(entry) = &val
+            && let Ok(default) = entry.raw_get::<LuaValue>("default")
+            && !default.is_nil()
+        {
+            merged.set(name.as_str(), default)?;
+        }
+    }
+    Ok(LuaValue::Table(merged))
 }
 
 fn api_noop(_: &Lua, _: LuaValue) -> LuaResult<()> {
@@ -878,7 +1098,7 @@ mod tests {
     #[test]
     fn empty_plugin_dir_loads_cleanly() {
         let dir = tmp_plugin_dir();
-        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
         // No tools registered
         let err = rt.call_tool("read", &[], &[]).unwrap_err();
         assert!(err.contains("not found"));
@@ -903,7 +1123,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
         let (output, is_error) = rt
             .call_tool("echo", &[], &[("text".into(), json!("hello"))])
             .unwrap();
@@ -930,7 +1150,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
         let (output, is_error) = rt.call_tool("t", &[], &[]).unwrap();
         assert_eq!(output, "ok");
         assert!(!is_error);
@@ -955,7 +1175,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
         let (output, is_error) = rt.call_tool("e", &[], &[]).unwrap();
         assert_eq!(output, "something went wrong");
         assert!(is_error);
@@ -987,7 +1207,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
         let (output, _) = rt
             .call_tool(
                 "reader",
@@ -1018,8 +1238,149 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
         let (output, _) = rt.call_tool("spliter", &[], &[]).unwrap();
         assert_eq!(output, "a|b|c");
+    }
+}
+
+#[cfg(test)]
+mod embedded_plugins {
+    use super::*;
+
+    const MISSING_PLUGIN_DIR: &str = "/nonexistent/plugins/path";
+    const AGENT_CONFIG_JSON: &str = r#"{"max_output_lines":2000,"max_output_bytes":51200,"stale_read_check":true,"tool_output_lines":{"bash":5,"code_execution":5,"task":5,"index":3,"grep":3,"read":3,"write":7,"web":3,"other":3}}"#;
+
+    fn embedded_runtime() -> ChildLuaRuntime {
+        ChildLuaRuntime::new(Path::new(MISSING_PLUGIN_DIR), Some(AGENT_CONFIG_JSON)).unwrap()
+    }
+
+    #[test]
+    fn embedded_plugins_register_child_tools() {
+        let rt = embedded_runtime();
+        let names = rt.registered_tool_names().unwrap();
+        for want in ["read", "write", "edit", "glob", "list", "grep"] {
+            assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+        }
+    }
+
+    #[test]
+    fn embedded_read_tool_returns_numbered_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("doc.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\ndelta\n").unwrap();
+
+        let rt = embedded_runtime();
+        let (out, err) = rt
+            .call_tool(
+                "read",
+                &[],
+                &[
+                    ("path".into(), json!(file.to_str().unwrap())),
+                    ("offset".into(), json!(1)),
+                    ("limit".into(), json!(2)),
+                ],
+            )
+            .unwrap();
+        assert!(!err, "{out}");
+        assert_eq!(
+            out,
+            "1: alpha\n2: beta\n\n...\n\nTruncated lines: 3-4. Use offset=3 to read further."
+        );
+    }
+
+    #[test]
+    fn embedded_grep_tool_finds_matches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo target\nthree\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "no hits\n").unwrap();
+
+        let rt = embedded_runtime();
+        let (out, err) = rt
+            .call_tool(
+                "grep",
+                &[],
+                &[
+                    ("pattern".into(), json!("target")),
+                    ("path".into(), json!(dir.path().to_str().unwrap())),
+                ],
+            )
+            .unwrap();
+        assert!(!err, "{out}");
+        assert!(out.contains("a.txt"), "{out}");
+        assert!(out.contains("2: two target"), "{out}");
+    }
+
+    #[test]
+    fn ctx_exposes_config_tracker_and_instructions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("probe")).unwrap();
+        std::fs::write(
+            dir.path().join("probe/init.lua"),
+            r#"
+            maki.api.register_tool({
+                name = "probe",
+                description = "probe the child ctx",
+                schema = { type = "object", properties = {} },
+                handler = function(input, ctx)
+                    local max_lines = ctx:config("max_output_lines", 111)
+                    local stale = ctx:config("stale_read_check")
+                    local tol = ctx:tool_output_lines()
+                    local read_tol = tol and tol.read or nil
+                    ctx:record_read(input.path)
+                    local ok, err = ctx:check_before_edit(input.path)
+                    local is_instr = ctx:is_instruction_file("AGENTS.md")
+                    local instrs = ctx:find_instructions(input.path)
+                    assert(type(instrs) == "table")
+                    return string.format("%s|%s|%s|%s|%s|%s",
+                        max_lines, tostring(stale), tostring(read_tol),
+                        tostring(ok), tostring(err), tostring(is_instr))
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+        let file = dir.path().join("target.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let rt = ChildLuaRuntime::new(dir.path(), Some(AGENT_CONFIG_JSON)).unwrap();
+        let (out, err) = rt
+            .call_tool(
+                "probe",
+                &[],
+                &[("path".into(), json!(file.to_str().unwrap()))],
+            )
+            .unwrap();
+        assert!(!err, "{out}");
+        assert_eq!(out, "2000|true|3|true|nil|true");
+    }
+
+    #[test]
+    fn register_options_returns_merged_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("opts_probe")).unwrap();
+        std::fs::write(
+            dir.path().join("opts_probe/init.lua"),
+            r#"
+            local opts = maki.api.register_options({
+                with_default = { default = 42, desc = "a number" },
+                no_default = { type = "integer", desc = "no default" },
+            })
+            maki.api.register_tool({
+                name = "opts_probe",
+                description = "report opts",
+                schema = { type = "object", properties = {} },
+                handler = function(_input, _ctx)
+                    return tostring(opts.with_default) .. "|" .. tostring(opts.no_default)
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let (out, err) = rt.call_tool("opts_probe", &[], &[]).unwrap();
+        assert!(!err, "{out}");
+        assert_eq!(out, "42|nil");
     }
 }

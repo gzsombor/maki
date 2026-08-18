@@ -37,6 +37,11 @@ const TRUSTED_TOOLS: &[&str] = &[
 
 const ENV_SANDBOX_FD: &str = "MAKI_SANDBOX_FD";
 
+/// Filesystem tools that execute inside the child via the Lua runtime.
+/// Everything else stays Rust-native (bash) or is forwarded to the parent
+/// (trusted tools), since the child's `maki.*` API is stripped down.
+const CHILD_LOCAL_TOOLS: &[&str] = &["read", "write", "edit", "multiedit", "glob", "grep", "list"];
+
 /// Upper bound for closing extraneous file descriptors in the fork child.
 /// Linux kernels typically limit default FDs to 1024.
 const MAX_FD_CLOSE: i32 = 1024;
@@ -280,7 +285,7 @@ impl InnerChild {
 
         // Load Lua plugins inside the sandbox for filesystem tools
         let plugin_dir = Path::new("/home/maki/.maki/plugins");
-        let lua_runtime = match ChildLuaRuntime::new(plugin_dir) {
+        let lua_runtime = match ChildLuaRuntime::new(plugin_dir, Some(&setup.config)) {
             Ok(rt) => {
                 debug!("sandbox child: lua runtime initialized");
                 Some(Arc::new(rt))
@@ -498,6 +503,10 @@ fn build_lua_tools(runtime: Arc<ChildLuaRuntime>) -> Result<HashMap<String, Tool
         .map_err(|e| SandboxError::Ipc(format!("lua_runtime: cannot list tools: {e}")))?;
 
     for name in names {
+        if !CHILD_LOCAL_TOOLS.contains(&name.as_str()) {
+            debug!(tool = %name, "build_lua_tools: not child-local, skipping");
+            continue;
+        }
         let rt = Arc::clone(&runtime);
         let tool_name = name.clone();
         tools.insert(

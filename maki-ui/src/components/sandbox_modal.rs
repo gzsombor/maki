@@ -24,11 +24,7 @@ const TITLE: &str = " Sandbox ";
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 85;
 
-const BROWSE_SETUP_MSG: maki_sandbox::ipc::SetupMessage = maki_sandbox::ipc::SetupMessage {
-    code: String::new(),
-    timeout_secs: 0,
-    max_memory: 0,
-};
+const BROWSE_SETUP_MSG: maki_sandbox::ipc::SetupMessage = maki_sandbox::ipc::SetupMessage::browse();
 
 #[derive(Clone, Debug, PartialEq)]
 enum Mode {
@@ -313,6 +309,11 @@ pub struct SandboxModal {
     spawn_error: Option<String>,
     /// Set when the user toggles `enabled` via the UI.
     enabled_changed: bool,
+    /// YOLO state as shown in the checkbox (owned by the app's permissions,
+    /// mirrored here for display).
+    yolo: bool,
+    /// Set when the user toggles YOLO via the UI.
+    yolo_changed: bool,
 }
 
 impl SandboxModal {
@@ -335,6 +336,8 @@ impl SandboxModal {
             profile_cursor,
             spawn_error: None,
             enabled_changed: false,
+            yolo: false,
+            yolo_changed: false,
         }
     }
 
@@ -400,6 +403,7 @@ impl SandboxModal {
             self.close_shell();
             self.spawn_error = None;
             self.enabled_changed = false;
+            self.yolo_changed = false;
             self.profile_cursor = if self.info.profiles.is_empty() {
                 None
             } else {
@@ -421,6 +425,22 @@ impl SandboxModal {
     /// Whether the sandbox is currently enabled.
     pub fn is_enabled(&self) -> bool {
         self.info.enabled
+    }
+
+    /// Mirror the app's live YOLO state into the checkbox for display.
+    pub fn set_yolo(&mut self, yolo: bool) {
+        self.yolo = yolo;
+    }
+
+    /// Returns and resets the `yolo_changed` flag.
+    /// The caller should check this after `handle_key` to apply to permissions.
+    pub fn take_yolo_changed(&mut self) -> bool {
+        std::mem::take(&mut self.yolo_changed)
+    }
+
+    fn toggle_yolo(&mut self) {
+        self.yolo = !self.yolo;
+        self.yolo_changed = true;
     }
 
     pub fn close(&mut self) {
@@ -604,6 +624,10 @@ impl SandboxModal {
                     self.toggle_sandbox_enabled();
                     true
                 }
+                KeyCode::Char('y') => {
+                    self.toggle_yolo();
+                    true
+                }
                 KeyCode::Up => {
                     if let Some(cursor) = self.profile_cursor
                         && cursor > 0
@@ -757,6 +781,31 @@ impl SandboxModal {
         )));
         let status_text = if info.enabled { "enabled" } else { "disabled" };
         lines.push(Line::from(format!("    {status_text}")));
+
+        // YOLO — skip permission prompts for all tools while on. Only shown
+        // when the sandbox is enabled, as it is a companion to sandboxing.
+        if info.enabled {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "  YOLO (press y to toggle) — skip permission prompts for all tools",
+                t.keybind_section,
+            )));
+            let yolo_toggle = if self.yolo { "x" } else { " " };
+            let yolo_style = if self.yolo {
+                t.item_selected
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("    [", Style::default()),
+                Span::styled(yolo_toggle, yolo_style),
+                Span::styled("] ", Style::default()),
+                Span::styled(
+                    if self.yolo { "on" } else { "off" },
+                    yolo_style,
+                ),
+            ]));
+        }
 
         // Profiles — right after Status, with cursor navigation and description
         if !info.profiles.is_empty() {

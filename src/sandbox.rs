@@ -75,12 +75,14 @@ pub(crate) async fn run_sandbox_with(
     code: String,
     timeout: Duration,
     fns: HashMap<String, Function>,
+    config_json: String,
 ) -> Result<Result<InterpreterResult, String>, mlua::Error> {
     sandbox
         .setup(&SetupMessage {
             code,
             timeout_secs: timeout.as_secs(),
             max_memory: 0,
+            config: config_json,
         })
         .map_err(|e| mlua::Error::runtime(format!("sandbox setup: {e}")))?;
 

@@ -603,6 +603,9 @@ impl App {
         #[cfg(all(feature = "sandbox", target_os = "linux"))]
         if key::SANDBOX.matches(key) {
             self.sandbox_modal.toggle();
+            if self.sandbox_modal.is_open() {
+                self.sandbox_modal.set_yolo(self.permissions.is_yolo());
+            }
             return Some(vec![]);
         }
         if key::TASKS.matches(key) {
@@ -738,6 +741,14 @@ impl App {
                     self.status_bar
                         .flash(format!("failed to save sandbox setting: {e}"));
                 }
+            }
+            if self.sandbox_modal.take_yolo_changed() {
+                let enabled = self.permissions.toggle_yolo();
+                self.flash(if enabled {
+                    "YOLO mode enabled".into()
+                } else {
+                    "YOLO mode disabled".into()
+                });
             }
             return Some(vec![]);
         }
@@ -1463,6 +1474,10 @@ impl App {
             "/cd" => self.cmd_cd(&cmd.args),
             "/yolo" => {
                 let enabled = self.permissions.toggle_yolo();
+                #[cfg(all(feature = "sandbox", target_os = "linux"))]
+                if self.sandbox_modal.is_open() {
+                    self.sandbox_modal.set_yolo(enabled);
+                }
                 let msg = if enabled {
                     "YOLO mode enabled"
                 } else {

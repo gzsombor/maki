@@ -175,6 +175,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &instructions.text,
         &params.prompt_slots,
         &params.model,
+        None,
     );
 
     let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
@@ -433,6 +434,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &instructions.text,
                         &params.prompt_slots,
                         &model,
+                        None,
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
