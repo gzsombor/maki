@@ -101,6 +101,27 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// Tools that execute inside the sandbox child instead of the host Lua
+/// plugins whenever sandbox mode is on.
+const SANDBOX_ROUTED_TOOLS: &[&str] =
+    &["bash", "read", "write", "edit", "multiedit", "glob", "grep", "list"];
+
+async fn sandbox_routed_reply(lua: &Lua, tool: &str, input: &Value) -> Option<ToolCallReply> {
+    let tool = tool.to_string();
+    let input = input.clone();
+    let router = lua
+        .app_data_ref::<Arc<maki_sandbox::Sandbox>>()
+        .map(|r| Arc::clone(&r))?;
+    let result = smol::unblock(move || router.call_tool(&tool, vec![input], Vec::new())).await;
+    match result {
+        Ok(r) => Some(ToolCallReply::plain(
+            r.error
+                .map(Err)
+                .unwrap_or_else(|| r.output.ok_or_else(|| "empty tool result".to_string())),
+        )),
+        Err(e) => Some(ToolCallReply::err(e.to_string())),
+    }
+}
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -214,6 +235,7 @@ pub enum Request {
         fallback: Option<Box<ClickFallback>>,
     },
     SetSandboxConfig(Arc<SandboxRunner>),
+    SetSandboxRouter(Arc<maki_sandbox::Sandbox>),
     RunKeybindCallback {
         id: u64,
     },
@@ -2404,6 +2426,12 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
+    if SANDBOX_ROUTED_TOOLS.contains(&tool.as_ref()) && ctx.sandbox_enabled() {
+        if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input).await {
+            return reply;
+        }
+        tracing::warn!(%tool, "sandbox routing failed; running tool on host");
+    }
     let handler: Function = {
         let plugins_ref = plugins.borrow();
         let Some(keys) = plugins_ref.get(&*plugin) else {
@@ -2888,6 +2916,9 @@ pub fn spawn(
                         }
                         Request::SetSandboxConfig(runner) => {
                             rt.lua.set_app_data(runner);
+                        }
+                        Request::SetSandboxRouter(sandbox) => {
+                            rt.lua.set_app_data(sandbox);
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {

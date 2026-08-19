@@ -146,11 +146,6 @@ mod sandbox_impl {
             }
         };
 
-        if let Err(e) = sandbox.setup(&maki_sandbox::ipc::SetupMessage::browse()) {
-            eprintln!("setup failed: {e}");
-            std::process::exit(1);
-        }
-
         let pwd = match sandbox.pwd() {
             Ok(p) => p,
             Err(e) => {

@@ -23,14 +23,21 @@ use ratatui::widgets::Paragraph;
 const TITLE: &str = " Sandbox ";
 const WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 85;
-
-const BROWSE_SETUP_MSG: maki_sandbox::ipc::SetupMessage = maki_sandbox::ipc::SetupMessage::browse();
+const YOLO_LABEL: &str = "Skip permission prompts for all tools";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Mode {
     Info,
     Browse,
     Shell,
+}
+
+/// Focus position in the info tab options list: the YOLO checkbox (only
+/// present while the sandbox is enabled), then each profile in order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InfoFocus {
+    Yolo,
+    Profile(usize),
 }
 
 /// Snapshot of sandbox configuration for display.
@@ -68,9 +75,6 @@ struct SandboxFileBrowser {
 
 impl SandboxFileBrowser {
     fn new(sandbox: Arc<Sandbox>) -> Result<Self, String> {
-        sandbox
-            .setup(&BROWSE_SETUP_MSG)
-            .map_err(|e| e.to_string())?;
         let pwd = sandbox.pwd().map_err(|e| e.to_string())?;
         let mut browser = Self {
             cwd: pwd,
@@ -227,9 +231,6 @@ struct SandboxShellState {
 
 impl SandboxShellState {
     fn new(sandbox: Arc<Sandbox>) -> Result<Self, String> {
-        sandbox
-            .setup(&BROWSE_SETUP_MSG)
-            .map_err(|e| e.to_string())?;
         let init_cwd = sandbox.pwd().unwrap_or_default();
         Ok(Self {
             sandbox,
@@ -305,7 +306,7 @@ pub struct SandboxModal {
     browser: Option<SandboxFileBrowser>,
     shell: Option<SandboxShellState>,
     shell_entry_count: usize,
-    profile_cursor: Option<usize>,
+    info_focus: Option<InfoFocus>,
     spawn_error: Option<String>,
     /// Set when the user toggles `enabled` via the UI.
     enabled_changed: bool,
@@ -318,11 +319,7 @@ pub struct SandboxModal {
 
 impl SandboxModal {
     pub fn new(info: SandboxInfo, sandbox: Option<Arc<Sandbox>>) -> Self {
-        let profile_cursor = if info.profiles.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        let info_focus = Self::first_focus(&info);
         Self {
             open: false,
             mode: Mode::Info,
@@ -333,7 +330,7 @@ impl SandboxModal {
             browser: None,
             shell: None,
             shell_entry_count: 0,
-            profile_cursor,
+            info_focus,
             spawn_error: None,
             enabled_changed: false,
             yolo: false,
@@ -404,11 +401,7 @@ impl SandboxModal {
             self.spawn_error = None;
             self.enabled_changed = false;
             self.yolo_changed = false;
-            self.profile_cursor = if self.info.profiles.is_empty() {
-                None
-            } else {
-                Some(0)
-            };
+            self.info_focus = Self::first_focus(&self.info);
         } else {
             self.close_browser();
             self.close_shell();
@@ -443,13 +436,112 @@ impl SandboxModal {
         self.yolo_changed = true;
     }
 
+    fn first_focus(info: &SandboxInfo) -> Option<InfoFocus> {
+        if info.enabled {
+            Some(InfoFocus::Yolo)
+        } else if info.profiles.is_empty() {
+            None
+        } else {
+            Some(InfoFocus::Profile(0))
+        }
+    }
+
+    fn focus_count(info: &SandboxInfo) -> usize {
+        info.profiles.len() + usize::from(info.enabled)
+    }
+
+    fn focus_index(info: &SandboxInfo, focus: &InfoFocus) -> usize {
+        match focus {
+            InfoFocus::Yolo => 0,
+            InfoFocus::Profile(i) => usize::from(info.enabled) + i,
+        }
+    }
+
+    fn focus_at(info: &SandboxInfo, idx: usize) -> Option<InfoFocus> {
+        let base = usize::from(info.enabled);
+        if idx < base {
+            Some(InfoFocus::Yolo)
+        } else if idx < base + info.profiles.len() {
+            Some(InfoFocus::Profile(idx - base))
+        } else {
+            None
+        }
+    }
+
+    fn move_focus(&mut self, delta: i32) {
+        let Some(focus) = self.info_focus else {
+            return;
+        };
+        let idx = Self::focus_index(&self.info, &focus) as i32 + delta;
+        let count = Self::focus_count(&self.info) as i32;
+        if idx < 0 || idx >= count {
+            return;
+        }
+        self.info_focus = Self::focus_at(&self.info, idx as usize);
+    }
+
+    fn toggle_focus(&mut self) {
+        let Some(focus) = self.info_focus else {
+            return;
+        };
+        match focus {
+            InfoFocus::Yolo => self.toggle_yolo(),
+            InfoFocus::Profile(i) => {
+                if let Some((_, enabled)) = self.info.profiles.get_mut(i) {
+                    *enabled = !*enabled;
+                    self.rebuild_env_entries();
+                }
+            }
+        }
+    }
+
+    /// Re-homes the focus when the options list no longer contains it
+    /// (sandbox toggled off with the YOLO checkbox focused, or a profile
+    /// removed).
+    fn clamp_focus(&mut self) {
+        let Some(focus) = self.info_focus else {
+            return;
+        };
+        let info = &self.info;
+        let gone = matches!(focus, InfoFocus::Yolo) && !info.enabled;
+        let out_of_range = Self::focus_index(info, &focus) >= Self::focus_count(info);
+        if gone || out_of_range {
+            self.info_focus = Self::first_focus(info);
+        }
+    }
+
+    fn option_line(&self, selected: bool, checked: bool, label: &str) -> Line<'static> {
+        let t = theme::current();
+        let sel_style = if selected {
+            t.item_selected
+        } else {
+            Style::default()
+        };
+        let prefix = if selected { "  ▸ " } else { "    " };
+        let toggle = if checked { "x" } else { " " };
+        Line::from(vec![
+            Span::styled(prefix, sel_style),
+            Span::styled("[", Style::default()),
+            Span::styled(
+                toggle,
+                if checked {
+                    t.item_selected
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled("] ", Style::default()),
+            Span::styled(label.to_owned(), sel_style),
+        ])
+    }
+
     pub fn close(&mut self) {
         self.open = false;
         self.close_browser();
         self.close_shell();
         self.spawn_error = None;
         self.scroll.reset();
-        self.profile_cursor = None;
+        self.info_focus = None;
     }
 
     fn close_browser(&mut self) {
@@ -496,6 +588,7 @@ impl SandboxModal {
         self.info.enabled = !self.info.enabled;
         self.enabled_changed = true;
         self.spawn_error = None;
+        self.clamp_focus();
     }
 
     fn spawn_browser(&mut self) {
@@ -619,39 +712,21 @@ impl SandboxModal {
             }
             _ if self.mode == Mode::Browse => self.handle_browse_key(key_event),
             _ if self.mode == Mode::Shell => self.handle_shell_key(key_event),
-            _ if self.mode == Mode::Info && self.profile_cursor.is_some() => match key_event.code {
+            _ if self.mode == Mode::Info && self.info_focus.is_some() => match key_event.code {
                 KeyCode::Char('s') => {
                     self.toggle_sandbox_enabled();
                     true
                 }
-                KeyCode::Char('y') => {
-                    self.toggle_yolo();
-                    true
-                }
                 KeyCode::Up => {
-                    if let Some(cursor) = self.profile_cursor
-                        && cursor > 0
-                    {
-                        self.profile_cursor = Some(cursor - 1);
-                    }
+                    self.move_focus(-1);
                     true
                 }
                 KeyCode::Down => {
-                    if let Some(cursor) = &mut self.profile_cursor {
-                        let max = self.info.profiles.len().saturating_sub(1);
-                        if *cursor < max {
-                            *cursor += 1;
-                        }
-                    }
+                    self.move_focus(1);
                     true
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(cursor) = self.profile_cursor
-                        && let Some((_, enabled)) = self.info.profiles.get_mut(cursor)
-                    {
-                        *enabled = !*enabled;
-                        self.rebuild_env_entries();
-                    }
+                    self.toggle_focus();
                     true
                 }
                 _ => {
@@ -761,18 +836,8 @@ impl SandboxModal {
 
     fn render_info(&mut self, lines: &mut Vec<Line>) {
         let t = theme::current();
+        self.clamp_focus();
         let info = &self.info;
-
-        // Clamp cursor in case profiles changed
-        if let Some(cursor) = self.profile_cursor
-            && cursor >= info.profiles.len()
-        {
-            self.profile_cursor = if info.profiles.is_empty() {
-                None
-            } else {
-                Some(0)
-            };
-        }
 
         // Status
         lines.push(Line::from(Span::styled(
@@ -782,70 +847,21 @@ impl SandboxModal {
         let status_text = if info.enabled { "enabled" } else { "disabled" };
         lines.push(Line::from(format!("    {status_text}")));
 
-        // YOLO — skip permission prompts for all tools while on. Only shown
-        // when the sandbox is enabled, as it is a companion to sandboxing.
-        if info.enabled {
+        // Options — YOLO checkbox (only while the sandbox is enabled),
+        // then profiles. One list, navigable with ↑/↓.
+        if info.enabled || !info.profiles.is_empty() {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
-                "  YOLO (press y to toggle) — skip permission prompts for all tools",
+                "  Options (navigate with ↑/↓, toggle with Enter/Space)",
                 t.keybind_section,
             )));
-            let yolo_toggle = if self.yolo { "x" } else { " " };
-            let yolo_style = if self.yolo {
-                t.item_selected
-            } else {
-                Style::default()
-            };
-            lines.push(Line::from(vec![
-                Span::styled("    [", Style::default()),
-                Span::styled(yolo_toggle, yolo_style),
-                Span::styled("] ", Style::default()),
-                Span::styled(
-                    if self.yolo { "on" } else { "off" },
-                    yolo_style,
-                ),
-            ]));
-        }
-
-        // Profiles — right after Status, with cursor navigation and description
-        if !info.profiles.is_empty() {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "  Profiles (navigate with ↑/↓, toggle with Enter/Space)",
-                t.keybind_section,
-            )));
+            if info.enabled {
+                let selected = self.info_focus == Some(InfoFocus::Yolo);
+                lines.push(self.option_line(selected, self.yolo, YOLO_LABEL));
+            }
             for (i, (profile, enabled)) in info.profiles.iter().enumerate() {
-                let selected = self.profile_cursor == Some(i);
-                let toggle = if *enabled { "x" } else { " " };
-                let prefix = if selected { "  ▸ " } else { "    " };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        prefix,
-                        if selected {
-                            t.item_selected
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::styled("[", Style::default()),
-                    Span::styled(
-                        toggle,
-                        if *enabled {
-                            t.item_selected
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::styled("] ", Style::default()),
-                    Span::styled(
-                        profile.name.clone(),
-                        if selected {
-                            t.item_selected
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                ]));
+                let selected = self.info_focus == Some(InfoFocus::Profile(i));
+                lines.push(self.option_line(selected, *enabled, &profile.name));
                 // Show mount details for the focused profile
                 if selected {
                     let mount_parts: Vec<String> = profile
@@ -1314,6 +1330,85 @@ mod tests {
         modal.toggle();
         modal.handle_key(key_ev(KeyCode::Tab));
         assert_eq!(modal.mode, Mode::Browse);
+    }
+
+    fn info_with(enabled: bool, profile_count: usize) -> SandboxInfo {
+        let profiles = (0..profile_count)
+            .map(|i| {
+                (
+                    SandboxProfile {
+                        name: format!("p{i}"),
+                        mounts: vec![],
+                    },
+                    false,
+                )
+            })
+            .collect();
+        SandboxInfo {
+            enabled,
+            env_entries: vec![],
+            workspace_dir: "/tmp".into(),
+            workspace_name: "tmp".into(),
+            home_mounts: vec![],
+            profiles,
+            extra_workspace_dirs: vec![],
+        }
+    }
+
+    #[test]
+    fn updown_navigates_yolo_and_profiles() {
+        let mut modal = SandboxModal::new(info_with(true, 2), None);
+        modal.toggle();
+        assert_eq!(modal.info_focus, Some(InfoFocus::Yolo));
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Profile(0)));
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Profile(1)));
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(
+            modal.info_focus,
+            Some(InfoFocus::Profile(1)),
+            "should not wrap past the last option"
+        );
+        modal.handle_key(key_ev(KeyCode::Up));
+        modal.handle_key(key_ev(KeyCode::Up));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Yolo));
+        modal.handle_key(key_ev(KeyCode::Up));
+        assert_eq!(
+            modal.info_focus,
+            Some(InfoFocus::Yolo),
+            "should not wrap past the first option"
+        );
+    }
+
+    #[test]
+    fn updown_navigates_profiles_only_when_disabled() {
+        let mut modal = SandboxModal::new(info_with(false, 2), None);
+        modal.toggle();
+        assert_eq!(modal.info_focus, Some(InfoFocus::Profile(0)));
+        modal.handle_key(key_ev(KeyCode::Down));
+        assert_eq!(modal.info_focus, Some(InfoFocus::Profile(1)));
+    }
+
+    #[test]
+    fn enter_toggles_focused_option() {
+        let mut modal = SandboxModal::new(info_with(true, 1), None);
+        modal.toggle();
+        modal.handle_key(key_ev(KeyCode::Enter));
+        assert!(modal.yolo, "Enter should toggle the YOLO checkbox");
+        assert!(modal.take_yolo_changed());
+        modal.handle_key(key_ev(KeyCode::Down));
+        modal.handle_key(key_ev(KeyCode::Char(' ')));
+        assert!(modal.info.profiles[0].1, "Space should toggle the profile");
+    }
+
+    #[test]
+    fn s_toggling_sandbox_off_rehomes_yolo_focus() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        assert_eq!(modal.info_focus, Some(InfoFocus::Yolo));
+        modal.handle_key(key_ev(KeyCode::Char('s')));
+        assert_eq!(modal.info_focus, None);
     }
 
     #[test]

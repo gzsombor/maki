@@ -65,7 +65,7 @@ pub fn build_system_prompt(
     let mut env = format!("{env}\n- Model: {}", model.spec());
     if let Some(sandbox_cwd) = sandbox_cwd {
         env.push_str(&format!(
-            "\n- Sandbox: code_execution runs at {sandbox_cwd} (a sandboxed copy of the working directory). Use that path space (or relative paths) inside code_execution; all other tools use the host working directory above."
+            "\n- Sandbox: sandbox mode is on. bash, read, write, edit, multiedit, glob, grep, list, and code_execution all run at {sandbox_cwd} (a sandboxed copy of the working directory). Use that path space (or relative paths) with these tools; everything else uses the host working directory above."
         ));
     }
     let instructions = format!("{env}{instructions}");
@@ -249,7 +249,7 @@ mod tests {
         let slots = crate::prompt::ResolvedSlots::default();
         let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let prompt = build_system_prompt(&vars, &AgentMode::Build, "", &slots, &model, sandbox_cwd);
-        assert_eq!(prompt.contains("code_execution runs at"), expect_note);
+        assert_eq!(prompt.contains("sandbox mode is on"), expect_note);
         if let Some(cwd) = sandbox_cwd {
             assert!(prompt.contains(cwd));
         }

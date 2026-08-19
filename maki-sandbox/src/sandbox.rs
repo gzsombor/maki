@@ -1,76 +1,118 @@
-use std::os::unix::net::UnixStream;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nix::unistd::Pid;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::error::SandboxError;
-use crate::ipc::{self, DirEntry, SetupMessage};
+use crate::ipc::{DirEntry, ParentMsg, ToolResultPayload};
 use crate::lock_or_poisoned;
 use crate::namespace::NamespaceConfig;
+use crate::{ChildIoResult, NoopDispatcher, PendingMap, SandboxResponse, ToolDispatcher};
 
-/// Shared handle to a sandboxed child process.
+/// Max wait for long-running requests (code runs, tool calls, execs).
+const RUN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Max wait for quick queries (ls, pwd, cd).
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared handle to a persistent sandboxed child process.
 ///
-/// Consumers hold `Arc<Sandbox>` and call methods on it. All IPC is
-/// serialized through an internal mutex. When the configuration changes,
-/// call [`reinit`](Sandbox::reinit) to tear down the old child and spawn
-/// a new one.
+/// Consumers hold `Arc<Sandbox>` and call methods on it. A dedicated IO
+/// thread owns the IPC socket and routes responses by call id, so calls may
+/// run concurrently (each gets its own call id and waiter). When the
+/// configuration changes, call [`reinit`](Sandbox::reinit) to tear down the
+/// old child and spawn a new one.
 pub struct Sandbox {
-    config: Mutex<NamespaceConfig>,
-    inner: Mutex<Option<SandboxInner>>,
+    inner: Mutex<Option<Arc<SandboxInner>>>,
+    dispatcher: Arc<Mutex<Arc<dyn ToolDispatcher>>>,
 }
 
 struct SandboxInner {
     pid: Pid,
-    sock: UnixStream,
+    tx: Sender<ParentMsg>,
+    next_id: Arc<AtomicU32>,
+    pending: Arc<Mutex<PendingMap>>,
+    io_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Sandbox {
-    fn child_mut(inner: &mut Option<SandboxInner>) -> Result<&mut SandboxInner, SandboxError> {
-        inner
-            .as_mut()
-            .ok_or_else(|| SandboxError::Ipc("sandbox not initialized (call reinit first)".into()))
-    }
-
-    fn child_ref(inner: &Option<SandboxInner>) -> Result<&SandboxInner, SandboxError> {
-        inner
-            .as_ref()
-            .ok_or_else(|| SandboxError::Ipc("sandbox not initialized (call reinit first)".into()))
-    }
-
-    /// Create a new sandbox and spawn the first child process.
+    /// Create a new sandbox, spawning a persistent child process.
+    ///
+    /// Trusted tools forwarded by the child fail until a dispatcher is
+    /// registered with [`set_dispatcher`](Sandbox::set_dispatcher).
     pub fn new(config: NamespaceConfig) -> Result<Arc<Self>, SandboxError> {
-        let (pid, sock) = crate::spawn_child(&config)?;
-        debug!(pid = %pid.as_raw(), "sandbox: spawned");
-        let inner = SandboxInner { pid, sock };
-        Ok(Arc::new(Self {
-            config: Mutex::new(config),
-            inner: Mutex::new(Some(inner)),
+        Self::with_dispatcher(config, Arc::new(NoopDispatcher))
+    }
+
+    /// Create a new sandbox with the given tool dispatcher.
+    pub fn with_dispatcher(
+        config: NamespaceConfig,
+        dispatcher: Arc<dyn ToolDispatcher>,
+    ) -> Result<Arc<Self>, SandboxError> {
+        let sandbox = Arc::new(Self {
+            inner: Mutex::new(None),
+            dispatcher: Arc::new(Mutex::new(dispatcher)),
+        });
+        let inner = Self::spawn_inner(&sandbox, &config)?;
+        *lock_or_poisoned(&sandbox.inner)? = Some(inner);
+        Ok(sandbox)
+    }
+
+    fn spawn_inner(
+        sandbox: &Self,
+        config: &NamespaceConfig,
+    ) -> Result<Arc<SandboxInner>, SandboxError> {
+        let (pid, sock) = crate::spawn_child(config)?;
+        debug!(pid = %pid.as_raw(), "sandbox: child spawned");
+        let (tx, rx) = mpsc::channel::<ParentMsg>();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let stdout_bufs = Arc::new(Mutex::new(HashMap::new()));
+        let io_handle = crate::parent_io_thread(
+            sock,
+            rx,
+            Arc::clone(&sandbox.dispatcher),
+            pending.clone(),
+            stdout_bufs,
+        )?;
+        Ok(Arc::new(SandboxInner {
+            pid,
+            tx,
+            next_id: Arc::new(AtomicU32::new(1)),
+            pending,
+            io_handle: Some(io_handle),
         }))
+    }
+
+    fn inner(&self) -> Result<Arc<SandboxInner>, SandboxError> {
+        lock_or_poisoned(&self.inner)?
+            .clone()
+            .ok_or_else(|| SandboxError::Ipc("sandbox not initialized (call reinit first)".into()))
+    }
+
+    /// Register the dispatcher used for trusted tool calls forwarded by the
+    /// child (webfetch, websearch, question, todo_write, task, memory, skill,
+    /// index).
+    pub fn set_dispatcher(&self, dispatcher: Arc<dyn ToolDispatcher>) {
+        match lock_or_poisoned(&self.dispatcher) {
+            Ok(mut guard) => *guard = dispatcher,
+            Err(e) => warn!("sandbox: set_dispatcher failed: {e}"),
+        }
     }
 
     /// Tear down the current child and spawn a new one with the given config.
     ///
-    /// Old children are sent [`Exit`](crate::ipc::ParentMsg::Exit) and waited
+    /// The old child is sent [`Exit`](crate::ipc::ParentMsg::Exit) and waited
     /// on before the new child is started.
     pub fn reinit(&self, config: NamespaceConfig) -> Result<(), SandboxError> {
-        // Drop old child (sends Exit + wait via SandboxInner::drop).
-        {
-            let old = lock_or_poisoned(&self.inner)?.take();
-            drop(old);
-        }
-        let (pid, sock) = crate::spawn_child(&config)?;
-        debug!(pid = %pid.as_raw(), "sandbox: reinit spawned");
-        *lock_or_poisoned(&self.config)? = config;
-        *lock_or_poisoned(&self.inner)? = Some(SandboxInner { pid, sock });
+        let old = lock_or_poisoned(&self.inner)?.take();
+        drop(old);
+        *lock_or_poisoned(&self.inner)? = Some(Self::spawn_inner(self, &config)?);
+        debug!("sandbox: reinit complete");
         Ok(())
-    }
-
-    /// Send a [`SetupMessage`] to the child (code, timeout, memory limit).
-    pub fn setup(&self, msg: &SetupMessage) -> Result<(), SandboxError> {
-        let mut inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_mut(&mut inner)?;
-        ipc::send_setup(&mut child.sock, msg)
     }
 
     /// The child's PID, if a child is running.
@@ -86,76 +128,206 @@ impl Sandbox {
 
     /// Wait for the child process to exit.
     pub fn wait(&self) -> Result<(), SandboxError> {
-        let pid = lock_or_poisoned(&self.inner)?
-            .as_ref()
-            .map(|c| c.pid)
-            .ok_or_else(|| SandboxError::Ipc("no child to wait on".into()))?;
-        crate::wait_child(pid)
-    }
-
-    // ── Browser / shell query methods ──
-
-    /// Clone the underlying stream for direct IPC access.
-    ///
-    /// Prefer the high-level methods ([`pwd`](Sandbox::pwd),
-    /// [`ls`](Sandbox::ls), etc.) unless you need raw socket access
-    /// (e.g. for diagnostic tools).
-    pub fn clone_stream(&self) -> Result<UnixStream, SandboxError> {
-        let inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_ref(&inner)?;
-        child
-            .sock
-            .try_clone()
-            .map_err(|e| SandboxError::Ipc(format!("clone stream: {e}")))
-    }
-
-    /// Query the child's current working directory.
-    pub fn pwd(&self) -> Result<String, SandboxError> {
-        let mut inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_mut(&mut inner)?;
-        ipc::query_pwd(&mut child.sock)
-    }
-
-    /// List directory entries in the child.
-    pub fn ls(&self, path: &str) -> Result<Vec<DirEntry>, SandboxError> {
-        let mut inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_mut(&mut inner)?;
-        ipc::query_ls(&mut child.sock, path)
-    }
-
-    /// Change the child's working directory.
-    pub fn cd(&self, path: &str) -> Result<(), SandboxError> {
-        let mut inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_mut(&mut inner)?;
-        ipc::query_cd(&mut child.sock, path)
-    }
-
-    /// Execute a shell command in the child. Returns `(output, is_error)`.
-    pub fn exec(&self, command: &str) -> Result<(String, bool), SandboxError> {
-        let mut inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_mut(&mut inner)?;
-        ipc::query_exec(&mut child.sock, command)
+        let inner = self.inner()?;
+        crate::wait_child(inner.pid)
     }
 
     /// Send an exit signal to the child.
     pub fn exit(&self) -> Result<(), SandboxError> {
-        let mut inner = lock_or_poisoned(&self.inner)?;
-        let child = Self::child_mut(&mut inner)?;
-        ipc::send_exit(&mut child.sock)
+        let inner = self.inner()?;
+        inner
+            .tx
+            .send(ParentMsg::Exit)
+            .map_err(|_| SandboxError::Ipc("io thread disconnected".into()))
+    }
+
+    /// Run code in the child's interpreter and wait for the result.
+    ///
+    /// `config` is a serialized `AgentConfig` applied to the child's Lua
+    /// runtime before the run starts.
+    pub fn run_code(
+        &self,
+        code: String,
+        timeout_secs: u64,
+        max_memory: usize,
+        config: String,
+    ) -> Result<ChildIoResult, SandboxError> {
+        let inner = self.inner()?;
+        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.wait_for(
+            call_id,
+            ParentMsg::Run {
+                call_id,
+                code,
+                timeout_secs,
+                max_memory,
+                config,
+            },
+            RUN_TIMEOUT,
+        )?;
+        match response {
+            SandboxResponse::Run(result) => Ok(result),
+            other => Err(SandboxError::Ipc(format!("expected Done, got {other:?}"))),
+        }
+    }
+
+    /// Execute a tool inside the sandbox namespace.
+    ///
+    /// Filesystem and bash tools run in the child; trusted tools are
+    /// forwarded to the parent's [`ToolDispatcher`].
+    pub fn call_tool(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+    ) -> Result<ToolResultPayload, SandboxError> {
+        let inner = self.inner()?;
+        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.wait_for(
+            call_id,
+            ParentMsg::ToolCall {
+                call_id,
+                name: name.to_owned(),
+                args,
+                kwargs,
+            },
+            RUN_TIMEOUT,
+        )?;
+        match response {
+            SandboxResponse::Tool(result) => Ok(result),
+            other => Err(SandboxError::Ipc(format!(
+                "expected ToolResult, got {other:?}"
+            ))),
+        }
+    }
+
+    /// List directory entries in the sandbox.
+    pub fn ls(&self, path: &str) -> Result<Vec<DirEntry>, SandboxError> {
+        let inner = self.inner()?;
+        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.wait_for(
+            call_id,
+            ParentMsg::Ls {
+                call_id,
+                path: path.to_owned(),
+            },
+            QUERY_TIMEOUT,
+        )?;
+        match response {
+            SandboxResponse::Ls(entries) => Ok(entries),
+            other => Err(SandboxError::Ipc(format!(
+                "expected LsResult, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Query the sandbox's current working directory.
+    pub fn pwd(&self) -> Result<String, SandboxError> {
+        let inner = self.inner()?;
+        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.wait_for(call_id, ParentMsg::Pwd { call_id }, QUERY_TIMEOUT)?;
+        match response {
+            SandboxResponse::Pwd(path) => Ok(path),
+            other => Err(SandboxError::Ipc(format!(
+                "expected PwdResult, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Change the sandbox's working directory.
+    pub fn cd(&self, path: &str) -> Result<(), SandboxError> {
+        let inner = self.inner()?;
+        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.wait_for(
+            call_id,
+            ParentMsg::Cd {
+                call_id,
+                path: path.to_owned(),
+            },
+            QUERY_TIMEOUT,
+        )?;
+        match response {
+            SandboxResponse::Cd => Ok(()),
+            SandboxResponse::Exec((output, true)) => Err(SandboxError::Ipc(output)),
+            other => Err(SandboxError::Ipc(format!(
+                "expected CdResult, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Execute a shell command in the sandbox. Returns `(output, is_error)`.
+    pub fn exec(&self, command: &str) -> Result<(String, bool), SandboxError> {
+        let inner = self.inner()?;
+        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self.wait_for(
+            call_id,
+            ParentMsg::Exec {
+                call_id,
+                command: command.to_owned(),
+            },
+            RUN_TIMEOUT,
+        )?;
+        match response {
+            SandboxResponse::Exec(result) => Ok(result),
+            other => Err(SandboxError::Ipc(format!(
+                "expected ExecResult, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Register a waiter for `call_id`, send `msg`, and block for the
+    /// matching response (or the timeout).
+    fn wait_for(
+        &self,
+        call_id: u32,
+        msg: ParentMsg,
+        timeout: Duration,
+    ) -> Result<SandboxResponse, SandboxError> {
+        let inner = self.inner()?;
+        let (tx, rx) = mpsc::channel::<Result<SandboxResponse, String>>();
+        lock_or_poisoned(&inner.pending)?.insert(call_id, tx);
+        if inner.tx.send(msg).is_err() {
+            let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+            return Err(SandboxError::Ipc("io thread disconnected".into()));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(response)) => {
+                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+                Ok(response)
+            }
+            Ok(Err(message)) => {
+                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+                Err(SandboxError::Ipc(message))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+                Err(SandboxError::Ipc(format!(
+                    "sandbox call timed out after {timeout:?}"
+                )))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+                Err(SandboxError::Ipc("sandbox io thread stopped".into()))
+            }
+        }
     }
 }
 
 impl Drop for SandboxInner {
     fn drop(&mut self) {
-        let _ = ipc::send_exit(&mut self.sock);
+        let _ = self.tx.send(ParentMsg::Exit);
         let _ = crate::wait_child(self.pid);
+        if let Some(handle) = self.io_handle.take()
+            && handle.join().is_err()
+        {
+            warn!("sandbox: parent io thread panicked");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::SetupMessage;
     use crate::namespace::NamespaceConfig;
     use std::path::PathBuf;
 
@@ -208,12 +380,11 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_setup_and_pwd() {
+    fn sandbox_pwd_returns_workspace() {
         let Some(sandbox) = try_sandbox() else {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let _ = sandbox.setup(&SetupMessage::browse());
         let pwd = match sandbox.pwd() {
             Ok(p) => p,
             Err(_) => {
@@ -230,7 +401,6 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let _ = sandbox.setup(&SetupMessage::browse());
         let (output, is_error) = match sandbox.exec("echo hello") {
             Ok(r) => r,
             Err(_) => {
@@ -264,7 +434,6 @@ mod tests {
                 return;
             }
         };
-        let _ = sandbox.setup(&SetupMessage::browse());
         let entries = match sandbox.ls(".") {
             Ok(e) => e,
             Err(_) => {
@@ -277,23 +446,47 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_run_code_prints() {
+        let Some(sandbox) = try_sandbox() else {
+            eprintln!("{SKIP_NO_NS}");
+            return;
+        };
+        let result = match sandbox.run_code("print('sandbox-ok')".into(), 30, 0, "{}".into()) {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("{SKIP_NO_NS}");
+                return;
+            }
+        };
+        assert!(
+            result.error.is_none(),
+            "run should not error: {:?}",
+            result.error
+        );
+        assert!(
+            result.stdout.contains("sandbox-ok"),
+            "stdout should contain the printed line: {:?}",
+            result.stdout
+        );
+    }
+
+    #[test]
     fn sandbox_exit_succeeds() {
         let Some(sandbox) = try_sandbox() else {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let _ = sandbox.setup(&SetupMessage::browse());
         let _ = sandbox.exit();
     }
 
     #[test]
-    fn sandbox_setup_without_init_returns_error() {
+    fn sandbox_call_without_init_returns_error() {
         let Some(sandbox) = try_sandbox() else {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
         drop(sandbox.inner.lock().unwrap().take());
-        let err = sandbox.setup(&SetupMessage::browse()).unwrap_err();
+        let err = sandbox.pwd().unwrap_err();
         assert!(err.to_string().contains("not initialized"));
     }
 }

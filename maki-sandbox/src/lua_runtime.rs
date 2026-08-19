@@ -52,6 +52,17 @@ impl ChildLuaRuntime {
         })
     }
 
+    /// Replace the serialized `AgentConfig` in the `_config` global.
+    pub fn set_config(&self, config_json: &str) -> Result<(), String> {
+        let value: Value =
+            serde_json::from_str(config_json).map_err(|e| format!("config json: {e}"))?;
+        let lua_value = json_to_lua(&self.lua, &value).map_err(|e| e.to_string())?;
+        self.lua
+            .globals()
+            .set(CONFIG_GLOBAL, lua_value)
+            .map_err(|e| e.to_string())
+    }
+
     /// Call a registered tool by name.
     pub fn call_tool(
         &self,

@@ -1,6 +1,5 @@
 #![cfg(all(feature = "sandbox", target_os = "linux"))]
 
-use maki_sandbox::ipc::SetupMessage;
 use maki_sandbox::namespace::NamespaceConfig;
 use std::path::PathBuf;
 
@@ -26,9 +25,6 @@ fn sandbox_shell_exec() {
 
     let sandbox = maki_sandbox::Sandbox::new(config)
         .expect("Sandbox::new should succeed (may need user namespace support)");
-    sandbox
-        .setup(&SetupMessage::browse())
-        .expect("setup should succeed");
 
     let pwd = sandbox.pwd().expect("pwd should succeed");
     assert!(!pwd.is_empty(), "pwd should not be empty");

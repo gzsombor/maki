@@ -8,17 +8,28 @@ pub mod namespace;
 pub mod profiles;
 pub mod sandbox;
 
+use std::collections::HashMap;
+use std::os::unix::io::AsFd;
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, getgid, getuid};
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::SandboxError;
-use crate::ipc::{ChildMsg, ParentMsg, SYNC_GO, SYNC_READY, ToolResultPayload};
+use crate::ipc::{
+    ChildMsg, DirEntry, NO_CALL_ID, ParentMsg, SYNC_GO, SYNC_READY, ToolResultPayload,
+};
 use crate::namespace::NamespaceConfig;
+
+/// Socket poll timeout in the parent's IO thread, in milliseconds.
+const IO_POLL_TIMEOUT_MS: u16 = 100;
+
+const SHUTDOWN_MSG: &str = "sandbox shutting down";
 
 /// Acquire a mutex lock, converting poison to [`SandboxError`].
 pub fn lock_or_poisoned<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, SandboxError> {
@@ -38,10 +49,9 @@ pub use sandbox::Sandbox;
 /// - Created a mount namespace
 /// - Set up bind mounts
 ///
-/// After this returns, the caller should:
-/// 1. Send a [`SetupMessage`](crate::ipc::SetupMessage) via [`ipc::send_setup`]
-/// 2. Enter the IPC loop (handle tool calls, stream stdout)
-/// 3. Read the final [`ChildMsg::Done`](crate::ipc::ChildMsg::Done) via the IPC socket
+/// After this returns, the child is in its persistent IO loop and accepts
+/// [`ParentMsg`](crate::ipc::ParentMsg) requests (runs, tool calls, queries)
+/// over the socket.
 pub fn spawn_child(config: &NamespaceConfig) -> Result<(Pid, UnixStream), SandboxError> {
     let (mut parent_sock, child_sock) =
         UnixStream::pair().map_err(|e| SandboxError::Ipc(format!("socketpair: {e}")))?;
@@ -106,115 +116,268 @@ pub trait ToolDispatcher: Send + Sync {
     ) -> Result<String, String>;
 }
 
-/// Callback type for streaming stdout lines from the sandbox child.
-pub type StdoutCallback = dyn Fn(&str) + Send + Sync;
+/// Dispatcher that rejects every tool call.
+///
+/// The default for [`Sandbox::new`](crate::Sandbox::new) until a real
+/// dispatcher is registered via [`Sandbox::set_dispatcher`](crate::Sandbox::set_dispatcher).
+#[derive(Default)]
+pub struct NoopDispatcher;
 
-/// Result of running the parent-side IO loop.
+impl ToolDispatcher for NoopDispatcher {
+    fn dispatch(
+        &self,
+        name: &str,
+        _args: Vec<Value>,
+        _kwargs: Vec<(String, Value)>,
+    ) -> Result<String, String> {
+        Err(format!("no tool dispatcher registered for '{name}'"))
+    }
+}
+
+/// Result of a code run inside the sandbox.
+#[derive(Debug)]
 pub struct ChildIoResult {
     pub output: Option<Value>,
     pub stdout: String,
     pub error: Option<String>,
 }
 
+/// A response to a parent-originated sandbox request, matched by call id.
+#[derive(Debug)]
+pub enum SandboxResponse {
+    Run(ChildIoResult),
+    Tool(ToolResultPayload),
+    Ls(Vec<DirEntry>),
+    Pwd(String),
+    Cd,
+    Exec((String, bool)),
+}
+
+pub type PendingMap = HashMap<u32, Sender<Result<SandboxResponse, String>>>;
+pub type StdoutBufs = HashMap<u32, String>;
+
 /// Parent-side IO handler for the sandbox child process.
 ///
-/// Runs in a dedicated thread, reading [`ChildMsg`] from the IPC socket and
-/// dispatching tool calls via the provided callback. Tool results are sent
-/// back as [`ParentMsg::ToolResult`].
-struct ChildIoHandler;
+/// Runs in a dedicated thread that owns the IPC socket: it sends queued
+/// [`ParentMsg`] requests and routes every [`ChildMsg`] back to the pending
+/// waiter for its call id. Tool calls forwarded by the child (trusted tools)
+/// are dispatched via the configured [`ToolDispatcher`] and answered with
+/// [`ParentMsg::ToolResult`].
+struct ParentIo {
+    sock: UnixStream,
+    inbound: Receiver<ParentMsg>,
+    dispatcher: Arc<Mutex<Arc<dyn ToolDispatcher>>>,
+    pending: Arc<Mutex<PendingMap>>,
+    stdout_bufs: Arc<Mutex<StdoutBufs>>,
+}
 
-impl ChildIoHandler {
-    fn run(
-        mut sock: UnixStream,
-        dispatch: Arc<dyn ToolDispatcher>,
-        stdout_cb: Option<Arc<StdoutCallback>>,
-        result: Arc<Mutex<Option<ChildIoResult>>>,
-    ) {
+/// Spawn the parent-side IO thread for a sandbox child socket.
+pub(crate) fn parent_io_thread(
+    sock: UnixStream,
+    inbound: Receiver<ParentMsg>,
+    dispatcher: Arc<Mutex<Arc<dyn ToolDispatcher>>>,
+    pending: Arc<Mutex<PendingMap>>,
+    stdout_bufs: Arc<Mutex<StdoutBufs>>,
+) -> Result<std::thread::JoinHandle<()>, SandboxError> {
+    let mut io = ParentIo {
+        sock,
+        inbound,
+        dispatcher,
+        pending,
+        stdout_bufs,
+    };
+    std::thread::Builder::new()
+        .name("sandbox-parent-io".into())
+        .spawn(move || io.run())
+        .map_err(|e| SandboxError::Ipc(format!("spawn sandbox-parent-io thread: {e}")))
+}
+
+impl ParentIo {
+    fn run(&mut self) {
         loop {
-            let msg = match ipc::recv_child_msg(&mut sock) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("sandbox parent: recv error: {e}");
-                    return;
+            if !self.drain_inbound() {
+                return;
+            }
+
+            let ready = {
+                let mut pollfds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
+                match poll(&mut pollfds, PollTimeout::from(IO_POLL_TIMEOUT_MS)) {
+                    Ok(0) => PollFlags::empty(),
+                    Ok(_) => pollfds[0].revents().unwrap_or(PollFlags::empty()),
+                    Err(e) => {
+                        error!("sandbox-parent-io: poll error: {e}");
+                        return;
+                    }
                 }
             };
+            if !ready.contains(PollFlags::POLLIN) {
+                continue;
+            }
 
-            match msg {
-                ChildMsg::ToolCall {
-                    call_id,
-                    name,
-                    args,
-                    kwargs,
-                } => {
-                    let (output, error) = match dispatch.dispatch(&name, args, kwargs) {
-                        Ok(o) => (Some(o), None),
-                        Err(e) => (None, Some(e)),
-                    };
-                    if let Err(e) = ipc::send_parent_msg(
-                        &mut sock,
-                        &ParentMsg::ToolResult {
-                            call_id,
-                            result: ToolResultPayload { output, error },
-                        },
-                    ) {
-                        warn!("sandbox parent: send tool result failed (call_id={call_id}): {e}");
+            match ipc::recv_child_msg(&mut self.sock) {
+                Ok(msg) => {
+                    if !self.route(msg) {
+                        return;
                     }
                 }
-                ChildMsg::Stdout { text } => {
-                    if let Some(cb) = &stdout_cb {
-                        cb(&text);
-                    }
-                }
-                ChildMsg::Done {
-                    output,
-                    stdout,
-                    error,
-                } => {
-                    if let Ok(mut guard) = lock_or_poisoned(&result) {
-                        *guard = Some(ChildIoResult {
-                            output,
-                            stdout,
-                            error,
-                        });
-                    }
+                Err(e) => {
+                    warn!("sandbox parent io: recv error: {e}");
+                    self.fail_all(format!("child closed the IPC socket: {e}"));
                     return;
                 }
-                _ => {}
             }
         }
     }
-}
 
-/// Result of [`run_child_io`]: a join handle and a shared result arc.
-pub type ChildIoHandle = (
-    std::thread::JoinHandle<()>,
-    Arc<Mutex<Option<ChildIoResult>>>,
-);
+    /// Send queued requests to the child. Returns false when a write fails
+    /// or the caller dropped its end of the queue.
+    fn drain_inbound(&mut self) -> bool {
+        loop {
+            match self.inbound.try_recv() {
+                Ok(msg) => match ipc::send_parent_msg(&mut self.sock, &msg) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!("sandbox parent io: send failed: {e}");
+                        return false;
+                    }
+                },
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => {
+                    debug!("sandbox parent io: inbound queue closed, shutting down");
+                    self.fail_all(SHUTDOWN_MSG.into());
+                    return false;
+                }
+            }
+        }
+    }
 
-/// Spawn a parent-side IO thread that handles tool calls from the sandbox child.
-///
-/// Spawns a background thread that:
-/// - Reads [`ChildMsg::ToolCall`] from the IPC socket
-/// - Dispatches each call via `dispatch`
-/// - Sends [`ParentMsg::ToolResult`] back to the child
-/// - Streams stdout via `stdout_cb`
-/// - Captures the final [`ChildMsg::Done`] result
-///
-/// Returns a join handle and a shared result arc.
-pub fn run_child_io(
-    sock: UnixStream,
-    dispatch: Arc<dyn ToolDispatcher>,
-    stdout_cb: Option<Arc<StdoutCallback>>,
-) -> Result<ChildIoHandle, SandboxError> {
-    let result = Arc::new(Mutex::new(None));
-    let result_clone = Arc::clone(&result);
+    /// Route one child message. Returns false to stop the IO thread.
+    fn route(&mut self, msg: ChildMsg) -> bool {
+        match msg {
+            ChildMsg::ToolCall {
+                call_id,
+                name,
+                args,
+                kwargs,
+            } => {
+                let dispatcher = self.current_dispatcher();
+                let (output, error) = match dispatcher.dispatch(&name, args, kwargs) {
+                    Ok(output) => (Some(output), None),
+                    Err(error) => (None, Some(error)),
+                };
+                let sent = ipc::send_parent_msg(
+                    &mut self.sock,
+                    &ParentMsg::ToolResult {
+                        call_id,
+                        result: ToolResultPayload { output, error },
+                    },
+                );
+                match sent {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(
+                            "sandbox parent io: send tool result failed (call_id={call_id}): {e}"
+                        );
+                        false
+                    }
+                }
+            }
+            ChildMsg::Stdout { call_id, text } => {
+                if let Ok(mut bufs) = self.stdout_bufs.lock() {
+                    bufs.entry(call_id).or_default().push_str(&text);
+                }
+                true
+            }
+            ChildMsg::Done {
+                call_id,
+                output,
+                stdout,
+                error,
+            } => {
+                let streamed = self
+                    .stdout_bufs
+                    .lock()
+                    .ok()
+                    .and_then(|mut bufs| bufs.remove(&call_id))
+                    .unwrap_or_default();
+                let stdout = if stdout.is_empty() { streamed } else { stdout };
+                let response = SandboxResponse::Run(ChildIoResult {
+                    output,
+                    stdout,
+                    error: error.clone(),
+                });
+                if self.deliver(call_id, Ok(response)) {
+                    true
+                } else if call_id == NO_CALL_ID {
+                    // Orphan Done without a call id means the child died during
+                    // setup; no further IPC is possible.
+                    warn!(error = ?error, "sandbox parent io: child failed fatally");
+                    self.fail_all(error.unwrap_or_else(|| "sandbox child exited".into()));
+                    false
+                } else {
+                    // Stale response to a call that already timed out; the
+                    // child keeps serving other requests.
+                    debug!(call_id, "sandbox parent io: stale Done for timed-out call");
+                    true
+                }
+            }
+            ChildMsg::ToolResult { call_id, result } => {
+                self.deliver(call_id, Ok(SandboxResponse::Tool(result)))
+            }
+            ChildMsg::LsResult { call_id, entries } => {
+                self.deliver(call_id, Ok(SandboxResponse::Ls(entries)))
+            }
+            ChildMsg::PwdResult { call_id, path } => {
+                self.deliver(call_id, Ok(SandboxResponse::Pwd(path)))
+            }
+            ChildMsg::CdResult { call_id } => self.deliver(call_id, Ok(SandboxResponse::Cd)),
+            ChildMsg::ExecResult {
+                call_id,
+                output,
+                is_error,
+            } => self.deliver(call_id, Ok(SandboxResponse::Exec((output, is_error)))),
+        }
+    }
 
-    let handle = std::thread::Builder::new()
-        .name("sandbox-parent-io".into())
-        .spawn(move || {
-            ChildIoHandler::run(sock, dispatch, stdout_cb, result_clone);
-        })
-        .map_err(|e| SandboxError::Ipc(format!("spawn sandbox-parent-io thread: {e}")))?;
+    fn current_dispatcher(&self) -> Arc<dyn ToolDispatcher> {
+        match self.dispatcher.lock() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(e) => {
+                warn!("sandbox parent io: dispatcher mutex poisoned: {e}");
+                Arc::new(NoopDispatcher)
+            }
+        }
+    }
 
-    Ok((handle, result))
+    /// Wake the waiter registered for `call_id`, if any.
+    fn deliver(&self, call_id: u32, response: Result<SandboxResponse, String>) -> bool {
+        match self.pending.lock() {
+            Ok(mut pending) => match pending.remove(&call_id) {
+                Some(tx) => {
+                    if tx.send(response).is_err() {
+                        debug!(call_id, "sandbox parent io: waiter gone");
+                        return false;
+                    }
+                    true
+                }
+                None => {
+                    debug!(call_id, "sandbox parent io: no pending waiter");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("sandbox parent io: pending mutex poisoned: {e}");
+                false
+            }
+        }
+    }
+
+    fn fail_all(&self, message: String) {
+        if let Ok(mut pending) = self.pending.lock() {
+            for (call_id, tx) in pending.drain() {
+                debug!(call_id, "sandbox parent io: failing pending waiter");
+                let _ = tx.send(Err(message.clone()));
+            }
+        }
+    }
 }

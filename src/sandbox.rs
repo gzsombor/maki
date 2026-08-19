@@ -2,71 +2,39 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::join_all;
 use maki_agent::tools::interpreter_bridge::build_tool_input;
-use maki_interpreter::PendingCall;
 use maki_interpreter::runner::InterpreterResult;
-use maki_lua::{json_to_lua, lua_tool_result};
 use maki_sandbox::ToolDispatcher;
-use maki_sandbox::ipc::SetupMessage;
-use maki_sandbox::run_child_io;
-use mlua::{Function, Lua};
+use mlua::{Function, Lua, Value as LuaValue};
 use serde_json::Value as JsonValue;
 
-type CallResults = Vec<(u32, Result<JsonValue, String>)>;
+/// Tools the child executes with local Rust functions, so the parent
+/// dispatcher never sees them.
+const CHILD_LOCAL_TOOLS: &[&str] = &["read", "write", "edit", "multiedit", "glob", "grep", "list"];
 
 enum BridgeMsg {
-    Calls(Vec<PendingCall>, flume::Sender<CallResults>),
-}
-
-struct BridgeDispatcher {
-    tx: flume::Sender<BridgeMsg>,
-}
-
-impl ToolDispatcher for BridgeDispatcher {
-    fn dispatch(
-        &self,
-        name: &str,
-        args: Vec<JsonValue>,
-        kwargs: Vec<(String, JsonValue)>,
-    ) -> Result<String, String> {
-        let call = PendingCall {
-            call_id: 0,
-            name: name.to_owned(),
-            args,
-            kwargs,
-        };
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        let _ = self.tx.send(BridgeMsg::Calls(vec![call], reply_tx));
-        let result: Option<JsonValue> = reply_rx
-            .recv()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .next()
-            .and_then(|(_, r)| r.ok());
-        result
-            .map(|v| v.to_string())
-            .ok_or_else(|| "no result from tool dispatch".into())
-    }
+    Call {
+        lua: Lua,
+        func: Function,
+        name: String,
+        arg: LuaValue,
+        reply: flume::Sender<Result<String, String>>,
+    },
 }
 
 async fn call_lua_tool(
     lua: Lua,
-    f: Option<Function>,
-    pc: &PendingCall,
-) -> Result<JsonValue, String> {
-    let Some(f) = f else {
-        return Err(format!("unknown tool: {}", pc.name));
-    };
-    let input = build_tool_input(&pc.args, &pc.kwargs)?;
-    let arg = json_to_lua(&lua, &input).map_err(|e| e.to_string())?;
-    let values = f
-        .call_async::<mlua::MultiValue>(arg)
-        .await
-        .map_err(|e| e.to_string())?;
-    lua_tool_result(values)
-        .map(JsonValue::String)
-        .map_err(|e| format!("{}: {e}", pc.name))
+    func: Function,
+    name: String,
+    arg: LuaValue,
+) -> Result<String, String> {
+    let thread = lua
+        .create_thread(func)
+        .map_err(|e| format!("{name}: {e}"))?;
+    let values: mlua::MultiValue =
+        thread.into_async(arg).map_err(|e| format!("{name}: {e}"))?.await
+            .map_err(|e| format!("{name}: {e}"))?;
+    maki_lua::lua_tool_result(values).map_err(|e| format!("{name}: {e}"))
 }
 
 pub(crate) async fn run_sandbox_with(
@@ -77,57 +45,72 @@ pub(crate) async fn run_sandbox_with(
     fns: HashMap<String, Function>,
     config_json: String,
 ) -> Result<Result<InterpreterResult, String>, mlua::Error> {
-    sandbox
-        .setup(&SetupMessage {
-            code,
-            timeout_secs: timeout.as_secs(),
-            max_memory: 0,
-            config: config_json,
-        })
-        .map_err(|e| mlua::Error::runtime(format!("sandbox setup: {e}")))?;
-
-    let io_sock = sandbox
-        .clone_stream()
-        .map_err(|e| mlua::Error::runtime(format!("sandbox clone: {e}")))?;
-
     let (bridge_tx, bridge_rx) = flume::unbounded::<BridgeMsg>();
 
-    let dispatch: Arc<dyn ToolDispatcher> = Arc::new(BridgeDispatcher { tx: bridge_tx });
+    struct BridgeDispatcher {
+        sandbox: Arc<maki_sandbox::Sandbox>,
+        lua: Lua,
+        fns: HashMap<String, Function>,
+        tx: flume::Sender<BridgeMsg>,
+    }
 
-    let (io_handle, result_arc) = run_child_io(io_sock, dispatch, None)
-        .map_err(|e| mlua::Error::runtime(format!("sandbox io thread: {e}")))?;
-
-    let recv_loop = async {
-        while let Ok(BridgeMsg::Calls(batch, reply)) = bridge_rx.recv_async().await {
-            let futs = batch.into_iter().map(|pc| {
-                let f = fns.get(&pc.name).cloned();
-                let lua = lua.clone();
-                async move { (pc.call_id, call_lua_tool(lua, f, &pc).await) }
+    impl ToolDispatcher for BridgeDispatcher {
+        fn dispatch(
+            &self,
+            name: &str,
+            args: Vec<JsonValue>,
+            kwargs: Vec<(String, JsonValue)>,
+        ) -> Result<String, String> {
+            if CHILD_LOCAL_TOOLS.contains(&name) {
+                return self
+                    .sandbox
+                    .call_tool(name, args, kwargs)
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| {
+                        r.error
+                            .map(Err)
+                            .unwrap_or_else(|| r.output.ok_or_else(|| "empty tool result".into()))
+                    });
+            }
+            let Some(func) = self.fns.get(name).cloned() else {
+                return Err(format!("unknown tool: {name}"));
+            };
+            let input = build_tool_input(&args, &kwargs).map_err(|e| e.to_string())?;
+            let arg = maki_lua::json_to_lua(&self.lua, &input).map_err(|e| e.to_string())?;
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let _ = self.tx.send(BridgeMsg::Call {
+                lua: self.lua.clone(),
+                func,
+                name: name.to_owned(),
+                arg,
+                reply: reply_tx,
             });
-            let _ = reply.send(join_all(futs).await);
+            reply_rx.recv().map_err(|e| e.to_string())?
         }
-    };
+    }
 
-    let sandbox_fut = {
-        let sandbox = Arc::clone(sandbox);
-        smol::unblock(move || {
-            let status = sandbox.wait();
-            (status, result_arc)
-        })
-    };
+    sandbox.set_dispatcher(Arc::new(BridgeDispatcher {
+        sandbox: Arc::clone(sandbox),
+        lua: lua.clone(),
+        fns,
+        tx: bridge_tx,
+    }));
 
-    let (status, result_arc) = sandbox_fut.await;
-    recv_loop.await;
+    let sandbox_arc = Arc::clone(sandbox);
+    let result = smol::unblock(move || sandbox_arc.run_code(code, timeout.as_secs(), 0, config_json))
+        .await
+        .map_err(|e| mlua::Error::runtime(format!("sandbox run: {e}")))?;
 
-    let _ = io_handle.join();
-
-    status.map_err(|e| mlua::Error::runtime(format!("sandbox wait: {e}")))?;
-
-    let result = result_arc
-        .lock()
-        .map_err(|e| mlua::Error::runtime(format!("result lock: {e}")))?
-        .take()
-        .ok_or_else(|| mlua::Error::runtime("sandbox did not return result"))?;
+    while let Ok(BridgeMsg::Call {
+        lua,
+        func,
+        name,
+        arg,
+        reply,
+    }) = bridge_rx.recv_async().await
+    {
+        let _ = reply.send(call_lua_tool(lua, func, name, arg).await);
+    }
 
     if let Some(err) = result.error {
         return Ok(Err(err));

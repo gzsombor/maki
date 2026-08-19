@@ -18,7 +18,7 @@ use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::error::SandboxError;
-use crate::ipc::{self, ChildMsg, DirEntry, ParentMsg, SetupMessage, ToolResultPayload};
+use crate::ipc::{self, ChildMsg, DirEntry, NO_CALL_ID, ParentMsg, ToolResultPayload};
 use crate::lua_runtime::ChildLuaRuntime;
 use crate::namespace::{self, NamespaceConfig};
 
@@ -46,6 +46,12 @@ const CHILD_LOCAL_TOOLS: &[&str] = &["read", "write", "edit", "multiedit", "glob
 /// Linux kernels typically limit default FDs to 1024.
 const MAX_FD_CLOSE: i32 = 1024;
 
+/// Socket poll timeout in the child's IO thread, in milliseconds.
+const IO_POLL_TIMEOUT_MS: u16 = 100;
+
+/// Error message for trusted-tool forwards aborted by a parent cancel/exit.
+const CANCELED_MSG: &str = "canceled";
+
 type PendingMap = HashMap<u32, Sender<Result<ToolResultPayload, String>>>;
 
 struct RemoteDispatch {
@@ -64,7 +70,6 @@ impl RemoteDispatch {
 
 enum IoCommand {
     SendChild(ChildMsg),
-    Shutdown,
 }
 
 /// Sets up namespaces, then execs or enters inner loop.
@@ -93,6 +98,7 @@ impl SandboxChild {
                 let _ = ipc::send_child_msg(
                     &mut self.sock,
                     &ChildMsg::Done {
+                        call_id: NO_CALL_ID,
                         output: None,
                         stdout: String::new(),
                         error: Some(e.to_string()),
@@ -202,7 +208,31 @@ pub fn child_inner_main() -> ! {
     SandboxChild::run_inner_static()
 }
 
+/// Work items executed by the child's worker (main) thread.
+enum Work {
+    Run(RunSpec),
+    ToolCall {
+        call_id: u32,
+        name: String,
+        args: Vec<Value>,
+        kwargs: Vec<(String, Value)>,
+    },
+    Exit,
+}
+
+struct RunSpec {
+    call_id: u32,
+    code: String,
+    timeout_secs: u64,
+    max_memory: usize,
+    config: String,
+}
+
 /// Runs inside the isolated filesystem after setup.
+///
+/// One IO thread owns the socket (all reads and all writes), while the main
+/// thread executes blocking work (code runs, tool calls) so slow tools never
+/// stall IPC. The tool map and Lua runtime live only on the worker thread.
 struct InnerChild {
     sock: UnixStream,
 }
@@ -213,79 +243,25 @@ impl InnerChild {
     }
 
     fn run(mut self) -> ! {
-        let result = self.inner_loop();
-        match result {
-            Ok(final_result) => {
-                let _ = ipc::send_child_msg(
-                    &mut self.sock,
-                    &ChildMsg::Done {
-                        output: final_result.output,
-                        stdout: final_result.stdout,
-                        error: None,
-                    },
-                );
-            }
+        let io_sock = match self.sock.try_clone() {
+            Ok(sock) => sock,
             Err(e) => {
-                let _ = ipc::send_child_msg(
-                    &mut self.sock,
-                    &ChildMsg::Done {
-                        output: None,
-                        stdout: String::new(),
-                        error: Some(e.to_string()),
-                    },
-                );
+                error!("sandbox child: socket clone failed: {e}");
+                std::process::exit(1);
             }
-        }
-        std::process::exit(0);
-    }
+        };
 
-    fn inner_loop(&mut self) -> Result<runner::InterpreterResult, SandboxError> {
-        let setup: SetupMessage = ipc::recv_setup(&mut self.sock)?;
-        debug!(
-            "sandbox child: received setup ({} bytes code)",
-            setup.code.len()
-        );
-
-        if setup.code.trim().is_empty() {
-            debug!(pid = %std::process::id(), "sandbox child: browse-only mode");
-            loop {
-                let msg = ipc::recv_parent_msg(&mut self.sock)?;
-                debug!(pid = %std::process::id(), msg = ?msg, "sandbox child: browse got msg");
-                match msg {
-                    ParentMsg::Exit => {
-                        debug!(pid = %std::process::id(), "sandbox child: browse exiting");
-                        return Ok(runner::InterpreterResult {
-                            output: None,
-                            stdout: String::new(),
-                        });
-                    }
-                    ref other => {
-                        Self::handle_fs_query(&mut self.sock, other)?;
-                    }
-                }
-            }
-        }
-
-        let io_sock = self
-            .sock
-            .try_clone()
-            .map_err(|e| SandboxError::Ipc(format!("clone: {e}")))?;
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<IoCommand>();
         let dispatch = Arc::new(RemoteDispatch {
             next_id: AtomicU32::new(1),
             pending: Mutex::new(HashMap::new()),
-            outgoing: outgoing_tx,
+            outgoing: outgoing_tx.clone(),
         });
-
-        let io_dispatch = Arc::clone(&dispatch);
-        let io_handle = std::thread::Builder::new()
-            .name("sandbox-io".into())
-            .spawn(move || IoHandler::run(io_sock, outgoing_rx, io_dispatch))
-            .map_err(|e| SandboxError::Ipc(format!("spawn io thread: {e}")))?;
+        let (work_tx, work_rx) = mpsc::channel::<Work>();
 
         // Load Lua plugins inside the sandbox for filesystem tools
         let plugin_dir = Path::new("/home/maki/.maki/plugins");
-        let lua_runtime = match ChildLuaRuntime::new(plugin_dir, Some(&setup.config)) {
+        let lua_runtime = match ChildLuaRuntime::new(plugin_dir, None) {
             Ok(rt) => {
                 debug!("sandbox child: lua runtime initialized");
                 Some(Arc::new(rt))
@@ -297,95 +273,147 @@ impl InnerChild {
         };
 
         let mut tools = build_bash_tool();
-        if let Some(ref rt) = lua_runtime {
-            tools.extend(build_lua_tools(Arc::clone(rt))?);
-        }
-        tools.extend(build_trusted_tools(Arc::clone(&dispatch))?);
-
-        let limits = runner::limits(Duration::from_secs(setup.timeout_secs), setup.max_memory);
-
-        let result = runner::run_streaming(&setup.code, &tools, None, limits, &mut |line| {
+        let setup = (|| -> Result<(), SandboxError> {
+            if let Some(ref rt) = lua_runtime {
+                tools.extend(build_lua_tools(Arc::clone(rt))?);
+            }
+            tools.extend(build_trusted_tools(Arc::clone(&dispatch))?);
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            error!("sandbox child: tool setup failed: {e}");
             let _ = ipc::send_child_msg(
                 &mut self.sock,
-                &ChildMsg::Stdout {
-                    text: line.to_string(),
+                &ChildMsg::Done {
+                    call_id: NO_CALL_ID,
+                    output: None,
+                    stdout: String::new(),
+                    error: Some(e.to_string()),
                 },
             );
-        });
-
-        let _ = dispatch.outgoing.send(IoCommand::Shutdown);
-        if io_handle.join().is_err() {
-            warn!("sandbox child: io thread panicked");
+            std::process::exit(1);
         }
 
-        match result {
-            Ok(interp_result) => {
-                debug!("sandbox child: interpreter finished");
-                Ok(interp_result)
-            }
-            Err(e) => {
-                debug!(error = %e, "sandbox child: interpreter error");
-                Err(SandboxError::Ipc(format!("interpreter: {e}")))
-            }
-        }
+        std::thread::Builder::new()
+            .name("sandbox-io".into())
+            .spawn(move || IoHandler::run(io_sock, outgoing_rx, dispatch, work_tx))
+            .expect("spawn sandbox-io thread");
+
+        Self::worker_loop(work_rx, outgoing_tx, tools, lua_runtime);
+        std::process::exit(0);
     }
 
-    fn handle_fs_query(sock: &mut UnixStream, cmd: &ParentMsg) -> Result<bool, SandboxError> {
-        match cmd {
-            ParentMsg::Ls { path } => {
-                let entries = list_dir_entries(path);
-                ipc::send_child_msg(sock, &ChildMsg::LsResult { entries })?;
-            }
-            ParentMsg::Pwd => {
-                let path = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                ipc::send_child_msg(sock, &ChildMsg::PwdResult { path })?;
-            }
-            ParentMsg::Cd { path } => match std::env::set_current_dir(path) {
-                Ok(()) => {
-                    ipc::send_child_msg(sock, &ChildMsg::CdResult)?;
+    fn worker_loop(
+        work_rx: Receiver<Work>,
+        outgoing_tx: Sender<IoCommand>,
+        tools: HashMap<String, ToolFn>,
+        lua_runtime: Option<Arc<ChildLuaRuntime>>,
+    ) {
+        while let Ok(work) = work_rx.recv() {
+            match work {
+                Work::Run(spec) => {
+                    if let Some(ref rt) = lua_runtime
+                        && let Err(e) = rt.set_config(&spec.config)
+                    {
+                        warn!(error = %e, "sandbox child: failed to apply run config");
+                    }
+                    let limits =
+                        runner::limits(Duration::from_secs(spec.timeout_secs), spec.max_memory);
+                    debug!(
+                        call_id = spec.call_id,
+                        code_len = spec.code.len(),
+                        "sandbox child: running code"
+                    );
+                    let outgoing = outgoing_tx.clone();
+                    let call_id = spec.call_id;
+                    let result =
+                        runner::run_streaming(&spec.code, &tools, None, limits, &mut |line| {
+                            let _ = outgoing.send(IoCommand::SendChild(ChildMsg::Stdout {
+                                call_id,
+                                text: line.to_string(),
+                            }));
+                        });
+                    match result {
+                        Ok(interp) => {
+                            debug!(call_id = spec.call_id, "sandbox child: run finished");
+                            let _ = outgoing_tx.send(IoCommand::SendChild(ChildMsg::Done {
+                                call_id: spec.call_id,
+                                output: interp.output,
+                                stdout: interp.stdout,
+                                error: None,
+                            }));
+                        }
+                        Err(e) => {
+                            warn!(
+                                call_id = spec.call_id,
+                                error = %e,
+                                "sandbox child: interpreter error"
+                            );
+                            let _ = outgoing_tx.send(IoCommand::SendChild(ChildMsg::Done {
+                                call_id: spec.call_id,
+                                output: None,
+                                stdout: String::new(),
+                                error: Some(format!("interpreter: {e}")),
+                            }));
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(path = %path, error = %e, "sandbox child: cd failed");
-                    ipc::send_child_msg(
-                        sock,
-                        &ChildMsg::ExecResult {
-                            output: format!("cd failed: {e}"),
-                            is_error: true,
+                Work::ToolCall {
+                    call_id,
+                    name,
+                    args,
+                    kwargs,
+                } => {
+                    let result = match tools.get(&name) {
+                        Some(tool) => tool(&name, args, kwargs),
+                        None => Err(format!("unknown tool: {name}")),
+                    };
+                    let payload = match result {
+                        Ok(output) => ToolResultPayload {
+                            output: Some(output.to_string()),
+                            error: None,
                         },
-                    )?;
-                }
-            },
-            ParentMsg::Exec { command } => match sandbox_exec(command, None) {
-                Ok((output, is_error)) => {
-                    ipc::send_child_msg(sock, &ChildMsg::ExecResult { output, is_error })?;
-                }
-                Err(e) => {
-                    ipc::send_child_msg(
-                        sock,
-                        &ChildMsg::ExecResult {
-                            output: e.to_string(),
-                            is_error: true,
+                        Err(error) => ToolResultPayload {
+                            output: None,
+                            error: Some(error),
                         },
-                    )?;
+                    };
+                    let _ = outgoing_tx.send(IoCommand::SendChild(ChildMsg::ToolResult {
+                        call_id,
+                        result: payload,
+                    }));
                 }
-            },
-            _ => return Ok(false),
+                Work::Exit => {
+                    debug!(pid = %std::process::id(), "sandbox child: worker exiting");
+                    break;
+                }
+            }
         }
-        Ok(true)
     }
 }
 
 /// IO thread handler for the sandbox child.
+///
+/// Owns the IPC socket: every read and every write on the child side
+/// happens here, so inline query results and queued tool traffic share a
+/// single writer.
 struct IoHandler;
 
 impl IoHandler {
-    fn run(mut sock: UnixStream, outgoing_rx: Receiver<IoCommand>, dispatch: Arc<RemoteDispatch>) {
+    fn run(
+        mut sock: UnixStream,
+        outgoing_rx: Receiver<IoCommand>,
+        dispatch: Arc<RemoteDispatch>,
+        work_tx: Sender<Work>,
+    ) {
         loop {
+            if !Self::drain_outgoing(&outgoing_rx, &mut sock) {
+                return;
+            }
+
             let ready = {
                 let mut pollfds = [PollFd::new(sock.as_fd(), PollFlags::POLLIN)];
-                match poll(&mut pollfds, PollTimeout::from(100u16)) {
+                match poll(&mut pollfds, PollTimeout::from(IO_POLL_TIMEOUT_MS)) {
                     Ok(0) => PollFlags::empty(),
                     Ok(_) => pollfds[0].revents().unwrap_or(PollFlags::empty()),
                     Err(e) => {
@@ -394,24 +422,19 @@ impl IoHandler {
                     }
                 }
             };
-
-            if !Self::drain_outgoing(&outgoing_rx, &mut sock) {
-                return;
+            if !ready.contains(PollFlags::POLLIN) {
+                continue;
             }
 
-            if ready.contains(PollFlags::POLLIN) {
-                match ipc::recv_parent_msg(&mut sock) {
-                    Ok(cmd) => {
-                        if let Err(e) = Self::handle_parent_msg(&mut sock, cmd, &dispatch) {
-                            error!("sandbox-io: handle error: {e}");
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("sandbox-io: recv error: {e}");
-                        return;
-                    }
+            let msg = match ipc::recv_parent_msg(&mut sock) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!("sandbox-io: recv error: {e}");
+                    return;
                 }
+            };
+            if !Self::handle_parent_msg(&mut sock, msg, &dispatch, &work_tx) {
+                return;
             }
         }
     }
@@ -425,7 +448,6 @@ impl IoHandler {
                         return false;
                     }
                 }
-                Ok(IoCommand::Shutdown) => return false,
                 Err(mpsc::TryRecvError::Empty) => return true,
                 Err(mpsc::TryRecvError::Disconnected) => return false,
             }
@@ -434,39 +456,114 @@ impl IoHandler {
 
     fn handle_parent_msg(
         sock: &mut UnixStream,
-        cmd: ParentMsg,
+        msg: ParentMsg,
         dispatch: &RemoteDispatch,
-    ) -> Result<(), SandboxError> {
-        if InnerChild::handle_fs_query(sock, &cmd)? {
-            return Ok(());
-        }
-        match cmd {
-            ParentMsg::Exit => {
-                std::process::exit(0);
+        work_tx: &Sender<Work>,
+    ) -> bool {
+        match msg {
+            ParentMsg::Run {
+                call_id,
+                code,
+                timeout_secs,
+                max_memory,
+                config,
+            } => work_tx
+                .send(Work::Run(RunSpec {
+                    call_id,
+                    code,
+                    timeout_secs,
+                    max_memory,
+                    config,
+                }))
+                .is_ok(),
+            ParentMsg::ToolCall {
+                call_id,
+                name,
+                args,
+                kwargs,
+            } => work_tx
+                .send(Work::ToolCall {
+                    call_id,
+                    name,
+                    args,
+                    kwargs,
+                })
+                .is_ok(),
+            ParentMsg::ToolResult { call_id, result } => {
+                let _ = dispatch.lock_pending().map(|mut pending| {
+                    pending.remove(&call_id).map(|tx| {
+                        let _ = tx.send(Ok(result));
+                    })
+                });
+                true
             }
             ParentMsg::Cancel => {
-                let pending = dispatch.lock_pending()?;
-                for tx in pending.values() {
-                    let _ = tx.send(Err("canceled by parent".into()));
-                }
+                Self::cancel_pending(dispatch);
+                true
             }
-            ParentMsg::ToolResult { call_id, result } => {
-                let pending = dispatch.lock_pending()?;
-                if let Some(tx) = pending.get(&call_id) {
-                    let _ = tx.send(Ok(result));
-                }
+            ParentMsg::Exec { call_id, command } => match sandbox_exec(&command, None) {
+                Ok((output, is_error)) => ipc::send_child_msg(
+                    sock,
+                    &ChildMsg::ExecResult {
+                        call_id,
+                        output,
+                        is_error,
+                    },
+                )
+                .is_ok(),
+                Err(e) => ipc::send_child_msg(
+                    sock,
+                    &ChildMsg::ExecResult {
+                        call_id,
+                        output: e.to_string(),
+                        is_error: true,
+                    },
+                )
+                .is_ok(),
+            },
+            ParentMsg::Ls { call_id, path } => ipc::send_child_msg(
+                sock,
+                &ChildMsg::LsResult {
+                    call_id,
+                    entries: list_dir_entries(&path),
+                },
+            )
+            .is_ok(),
+            ParentMsg::Pwd { call_id } => {
+                let path = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                ipc::send_child_msg(sock, &ChildMsg::PwdResult { call_id, path }).is_ok()
             }
-            ParentMsg::ToolBatchResult { results } => {
-                let pending = dispatch.lock_pending()?;
-                for (call_id, result) in results {
-                    if let Some(tx) = pending.get(&call_id) {
-                        let _ = tx.send(Ok(result));
-                    }
+            ParentMsg::Cd { call_id, path } => match std::env::set_current_dir(&path) {
+                Ok(()) => ipc::send_child_msg(sock, &ChildMsg::CdResult { call_id }).is_ok(),
+                Err(e) => {
+                    warn!(path = %path, error = %e, "sandbox child: cd failed");
+                    ipc::send_child_msg(
+                        sock,
+                        &ChildMsg::ExecResult {
+                            call_id,
+                            output: format!("cd failed: {e}"),
+                            is_error: true,
+                        },
+                    )
+                    .is_ok()
                 }
+            },
+            ParentMsg::Exit => {
+                Self::cancel_pending(dispatch);
+                let _ = work_tx.send(Work::Exit);
+                false
             }
-            _ => {}
         }
-        Ok(())
+    }
+
+    fn cancel_pending(dispatch: &RemoteDispatch) {
+        if let Ok(mut pending) = dispatch.lock_pending() {
+            for tx in pending.drain().map(|(_, tx)| tx) {
+                let _ = tx.send(Err(CANCELED_MSG.into()));
+            }
+        }
     }
 }
 

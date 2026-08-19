@@ -150,6 +150,15 @@ impl LuaCtx {
         }
     }
 
+    /// Sandbox is active only for tool handlers whose context carries the
+    /// live agent config; start and restore caps have none.
+    pub(crate) fn sandbox_enabled(&self) -> bool {
+        matches!(
+            &self.caps,
+            Caps::Handler { agent, .. } if agent.config.sandbox_enabled
+        )
+    }
+
     /// Dispatch capability: only handler ctxs can call `maki.agent.*`.
     pub(crate) fn agent(&self) -> Option<&AgentContext> {
         match &self.caps {

@@ -67,12 +67,6 @@ mod sandbox_impl {
                 std::process::exit(1);
             }
         };
-        sandbox
-            .setup(&maki_sandbox::ipc::SetupMessage::browse())
-            .unwrap_or_else(|e| {
-                eprintln!("  setup FAILED: {e}");
-                std::process::exit(1);
-            });
         let pid = match sandbox.pid() {
             Some(p) => p.to_string(),
             None => "unknown".into(),
@@ -89,13 +83,6 @@ mod sandbox_impl {
         eprintln!();
 
         eprintln!("[5/8] Probing key paths with Ls...");
-        let mut sock = match sandbox.clone_stream() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  FAILED to clone stream: {e}");
-                return;
-            }
-        };
         for path in &[
             "/",
             "/bin",
@@ -105,7 +92,7 @@ mod sandbox_impl {
             "/lib64",
             "/lib/x86_64-linux-gnu",
         ] {
-            probe_ls(&mut sock, path);
+            probe_ls(&sandbox, path);
         }
         eprintln!();
 
@@ -121,7 +108,7 @@ mod sandbox_impl {
             "/lib/x86_64-linux-gnu/libc.so.6",
             "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
         ] {
-            probe_exists(&mut sock, path);
+            probe_exists(&sandbox, path);
         }
         eprintln!();
 
@@ -144,7 +131,7 @@ mod sandbox_impl {
             // Try using absolute path to linker directly
             "/lib64/ld-linux-x86-64.so.2 --help 2>&1 | head -3",
         ] {
-            run_cmd(&mut sock, cmd);
+            run_cmd(&sandbox, cmd);
         }
         eprintln!();
 
@@ -219,9 +206,9 @@ mod sandbox_impl {
         }
     }
 
-    fn probe_ls(sock: &mut UnixStream, path: &str) {
+    fn probe_ls(sb: &Sandbox, path: &str) {
         eprint!("  ls {path} ... ");
-        match ipc::query_ls(sock, path) {
+        match sb.ls(path) {
             Ok(entries) => {
                 let total = entries.len();
                 let dirs = entries.iter().filter(|e| e.is_dir).count();
@@ -239,14 +226,14 @@ mod sandbox_impl {
         }
     }
 
-    fn probe_exists(sock: &mut UnixStream, path: &str) {
+    fn probe_exists(sb: &Sandbox, path: &str) {
         let parent = Path::new(path).parent().unwrap_or(Path::new("/"));
         let name = Path::new(path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         eprint!("  check {path} ... ");
-        match ipc::query_ls(sock, &parent.to_string_lossy()) {
+        match sb.ls(&parent.to_string_lossy()) {
             Ok(entries) => {
                 if entries.iter().any(|e| e.name == name) {
                     eprintln!("EXISTS");
@@ -507,9 +494,9 @@ mod sandbox_impl {
         }
     }
 
-    fn run_cmd(sock: &mut UnixStream, command: &str) {
+    fn run_cmd(sb: &Sandbox, command: &str) {
         eprint!("  $ {command} ... ");
-        match ipc::query_exec(sock, command) {
+        match sb.exec(command) {
             Ok((output, is_error)) => {
                 if is_error {
                     eprintln!("ERROR (exit != 0):");

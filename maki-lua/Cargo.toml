@@ -20,6 +20,7 @@ maki-interpreter = { workspace = true }
 maki-lua-macro = { workspace = true }
 maki-markdown = { workspace = true }
 maki-providers = { workspace = true }
+maki-sandbox = { workspace = true, optional = true }
 mlua = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -77,6 +78,9 @@ tree-sitter-make = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
+
+[features]
+sandbox = ["dep:maki-sandbox"]
 
 [dev-dependencies]
 base64 = { workspace = true }
