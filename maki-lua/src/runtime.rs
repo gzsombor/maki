@@ -106,6 +106,7 @@ const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 const SANDBOX_ROUTED_TOOLS: &[&str] =
     &["bash", "read", "write", "edit", "multiedit", "glob", "grep", "list"];
 
+#[cfg(feature = "sandbox")]
 async fn sandbox_routed_reply(lua: &Lua, tool: &str, input: &Value) -> Option<ToolCallReply> {
     let tool = tool.to_string();
     let input = input.clone();
@@ -235,6 +236,7 @@ pub enum Request {
         fallback: Option<Box<ClickFallback>>,
     },
     SetSandboxConfig(Arc<SandboxRunner>),
+#[cfg(feature = "sandbox")]
     SetSandboxRouter(Arc<maki_sandbox::Sandbox>),
     RunKeybindCallback {
         id: u64,
@@ -2427,10 +2429,15 @@ async fn run_tool_call(
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
     if SANDBOX_ROUTED_TOOLS.contains(&tool.as_ref()) && ctx.sandbox_enabled() {
-        if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input).await {
-            return reply;
+        #[cfg(feature = "sandbox")]
+        {
+            if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input).await {
+                return reply;
+            }
+            tracing::warn!(%tool, "sandbox routing failed; running tool on host");
         }
-        tracing::warn!(%tool, "sandbox routing failed; running tool on host");
+        #[cfg(not(feature = "sandbox"))]
+        tracing::warn!(%tool, "sandbox routing requested but sandbox feature is disabled");
     }
     let handler: Function = {
         let plugins_ref = plugins.borrow();
@@ -2917,6 +2924,7 @@ pub fn spawn(
                         Request::SetSandboxConfig(runner) => {
                             rt.lua.set_app_data(runner);
                         }
+                        #[cfg(feature = "sandbox")]
                         Request::SetSandboxRouter(sandbox) => {
                             rt.lua.set_app_data(sandbox);
                         }

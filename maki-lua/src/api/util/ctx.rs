@@ -86,6 +86,7 @@ pub(crate) struct LuaCtx {
     pub(crate) finish_tx: Option<flume::Sender<ToolCallReply>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Caps {
     Handler {
         agent: Box<AgentContext>,

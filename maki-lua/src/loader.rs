@@ -449,7 +449,11 @@ impl PluginHost {
         self.inner.ui_action_rx.clone()
     }
 
-    pub fn set_sandbox_router(&self, sandbox: Arc<maki_sandbox::Sandbox>) -> Result<(), PluginError> {
+    #[cfg(feature = "sandbox")]
+    pub fn set_sandbox_router(
+        &self,
+        sandbox: Arc<maki_sandbox::Sandbox>,
+    ) -> Result<(), PluginError> {
         if let Err(e) = self.inner.tx.try_send(Request::SetSandboxRouter(sandbox)) {
             tracing::warn!("failed to send sandbox router to lua runtime: {e}");
             Err(PluginError::HostDead)

@@ -46,7 +46,7 @@ open = { workspace = true }
 
 [features]
 default = ["sandbox"]
-sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox", "maki-ui/sandbox"]
+sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox", "maki-ui/sandbox", "maki-lua/sandbox"]
 
 [dev-dependencies]
 test-case = { workspace = true }
