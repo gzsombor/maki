@@ -576,7 +576,12 @@ fn build_bash_tool() -> HashMap<String, ToolFn> {
             let workdir = kwargs
                 .iter()
                 .find(|(k, _)| k == "workdir")
-                .and_then(|(_, v)| v.as_str());
+                .and_then(|(_, v)| v.as_str())
+                .or_else(|| {
+                    args.first()
+                        .and_then(|a| a.get("workdir"))
+                        .and_then(|v| v.as_str())
+                });
             match sandbox_exec(&command, workdir) {
                 Ok((output, _is_error)) => Ok(Value::String(output)),
                 Err(e) => Err(format!("bash failed: {e}")),
@@ -792,11 +797,18 @@ fn require_str(args: &[Value], kwargs: &[(String, Value)], name: &str) -> Result
             .map(String::from)
             .ok_or_else(|| format!("{name} must be a string"));
     }
-    if !args.is_empty() {
-        return args[0]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| "first arg must be a string".to_string());
+    if let Some(first) = args.first() {
+        if let Some(s) = first.as_str() {
+            return Ok(s.to_string());
+        }
+        // LLM sends the whole input object as args[0]; unwrap it.
+        if let Some(val) = first.get(name) {
+            return val
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| format!("{name} must be a string"));
+        }
+        return Err("first arg must be a string".to_string());
     }
     Err(format!("missing required argument: {name}"))
 }
@@ -845,6 +857,20 @@ mod tests {
             err.contains("must be a string"),
             "expected type error, got: {err}"
         );
+    }
+
+    #[test]
+    fn require_str_from_object_in_args() {
+        let args = vec![json!({"command": "ls -la", "workdir": "/tmp"})];
+        let kwargs: Vec<(String, Value)> = vec![];
+        assert_eq!(require_str(&args, &kwargs, "command").unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn require_str_object_missing_key_errors() {
+        let args = vec![json!({"other": "x"})];
+        let kwargs: Vec<(String, Value)> = vec![];
+        assert!(require_str(&args, &kwargs, "command").is_err());
     }
 
     #[test]

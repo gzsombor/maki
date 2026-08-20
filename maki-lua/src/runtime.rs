@@ -103,8 +103,28 @@ const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 /// Tools that execute inside the sandbox child instead of the host Lua
 /// plugins whenever sandbox mode is on.
-const SANDBOX_ROUTED_TOOLS: &[&str] =
-    &["bash", "read", "write", "edit", "multiedit", "glob", "grep", "list"];
+const SANDBOX_ROUTED_TOOLS: &[&str] = &[
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "multiedit",
+    "glob",
+    "grep",
+    "list",
+];
+
+/// Splits a JSON input value into the (args, kwargs) form expected by the
+/// sandbox child's native tool handlers. Objects are flattened into kwargs;
+/// non-object values are passed as a single positional arg.
+fn split_input(input: &Value) -> (Vec<Value>, Vec<(String, Value)>) {
+    if let Value::Object(map) = input {
+        let kwargs: Vec<(String, Value)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        (Vec::new(), kwargs)
+    } else {
+        (vec![input.clone()], Vec::new())
+    }
+}
 
 #[cfg(feature = "sandbox")]
 async fn sandbox_routed_reply(lua: &Lua, tool: &str, input: &Value) -> Option<ToolCallReply> {
@@ -113,13 +133,12 @@ async fn sandbox_routed_reply(lua: &Lua, tool: &str, input: &Value) -> Option<To
     let router = lua
         .app_data_ref::<Arc<maki_sandbox::Sandbox>>()
         .map(|r| Arc::clone(&r))?;
-    let result = smol::unblock(move || router.call_tool(&tool, vec![input], Vec::new())).await;
+    let (args, kwargs) = split_input(&input);
+    let result = smol::unblock(move || router.call_tool(&tool, args, kwargs)).await;
     match result {
-        Ok(r) => Some(ToolCallReply::plain(
-            r.error
-                .map(Err)
-                .unwrap_or_else(|| r.output.ok_or_else(|| "empty tool result".to_string())),
-        )),
+        Ok(r) => Some(ToolCallReply::plain(r.error.map(Err).unwrap_or_else(
+            || r.output.ok_or_else(|| "empty tool result".to_string()),
+        ))),
         Err(e) => Some(ToolCallReply::err(e.to_string())),
     }
 }
@@ -236,7 +255,7 @@ pub enum Request {
         fallback: Option<Box<ClickFallback>>,
     },
     SetSandboxConfig(Arc<SandboxRunner>),
-#[cfg(feature = "sandbox")]
+    #[cfg(feature = "sandbox")]
     SetSandboxRouter(Arc<maki_sandbox::Sandbox>),
     RunKeybindCallback {
         id: u64,
@@ -4147,5 +4166,36 @@ mod tests {
             }
             panic!("gate count never reached 0 after draining");
         }));
+    }
+
+    #[cfg(feature = "sandbox")]
+    mod split_input_tests {
+        use super::*;
+        use serde_json::json;
+        use test_case::test_case;
+
+        #[test_case(json!({"command": "ls -la", "description": "list files"}); "object_flattens_to_kwargs")]
+        #[test_case(json!({"a": 1, "b": "x"}); "object_two_fields")]
+        #[test_case(json!({}); "empty_object_no_args_no_kwargs")]
+        #[test_case(json!("plain string"); "non_object_goes_to_args")]
+        #[test_case(json!(42); "number_goes_to_args")]
+        #[test_case(json!(null); "null_goes_to_args")]
+        fn split_input_cases(input: Value) {
+            let (args, kwargs) = split_input(&input);
+            match input {
+                Value::Object(map) => {
+                    assert!(args.is_empty());
+                    assert_eq!(kwargs.len(), map.len());
+                    for (k, v) in &map {
+                        let found = kwargs.iter().find(|(kk, _)| kk == k);
+                        assert_eq!(found.map(|(_, vv)| vv), Some(v), "field {k} missing or mismatched");
+                    }
+                }
+                _ => {
+                    assert_eq!(args, vec![input]);
+                    assert!(kwargs.is_empty());
+                }
+            }
+        }
     }
 }
