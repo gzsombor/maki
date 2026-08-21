@@ -103,36 +103,10 @@ pub fn wait_child(pid: Pid) -> Result<(), SandboxError> {
     }
 }
 
-/// Trait for dispatching tool calls from the sandbox child.
-///
-/// Implementations decide how each tool call is handled: directly
-/// (e.g. calling a Lua function) or forwarded (e.g. over IPC).
-pub trait ToolDispatcher: Send + Sync {
-    fn dispatch(
-        &self,
-        name: &str,
-        args: Vec<Value>,
-        kwargs: Vec<(String, Value)>,
-    ) -> Result<String, String>;
-}
-
-/// Dispatcher that rejects every tool call.
-///
-/// The default for [`Sandbox::new`](crate::Sandbox::new) until a real
-/// dispatcher is registered via [`Sandbox::set_dispatcher`](crate::Sandbox::set_dispatcher).
-#[derive(Default)]
-pub struct NoopDispatcher;
-
-impl ToolDispatcher for NoopDispatcher {
-    fn dispatch(
-        &self,
-        name: &str,
-        _args: Vec<Value>,
-        _kwargs: Vec<(String, Value)>,
-    ) -> Result<String, String> {
-        Err(format!("no tool dispatcher registered for '{name}'"))
-    }
-}
+/// Handler for trusted tool calls forwarded by the child during a
+/// [`Sandbox::run_code`](crate::Sandbox::run_code) call.
+pub type ToolHandler =
+    dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<String, String> + Send + Sync;
 
 /// Result of a code run inside the sandbox.
 #[derive(Debug)]
@@ -161,12 +135,12 @@ pub type StdoutBufs = HashMap<u32, String>;
 /// Runs in a dedicated thread that owns the IPC socket: it sends queued
 /// [`ParentMsg`] requests and routes every [`ChildMsg`] back to the pending
 /// waiter for its call id. Tool calls forwarded by the child (trusted tools)
-/// are dispatched via the configured [`ToolDispatcher`] and answered with
-/// [`ParentMsg::ToolResult`].
+/// are answered by the handler of the active
+/// [`run_code`](crate::Sandbox::run_code) call.
 struct ParentIo {
     sock: UnixStream,
     inbound: Receiver<ParentMsg>,
-    dispatcher: Arc<Mutex<Arc<dyn ToolDispatcher>>>,
+    handler: Arc<Mutex<Option<Arc<ToolHandler>>>>,
     pending: Arc<Mutex<PendingMap>>,
     stdout_bufs: Arc<Mutex<StdoutBufs>>,
 }
@@ -175,14 +149,14 @@ struct ParentIo {
 pub(crate) fn parent_io_thread(
     sock: UnixStream,
     inbound: Receiver<ParentMsg>,
-    dispatcher: Arc<Mutex<Arc<dyn ToolDispatcher>>>,
+    handler: Arc<Mutex<Option<Arc<ToolHandler>>>>,
     pending: Arc<Mutex<PendingMap>>,
     stdout_bufs: Arc<Mutex<StdoutBufs>>,
 ) -> Result<std::thread::JoinHandle<()>, SandboxError> {
     let mut io = ParentIo {
         sock,
         inbound,
-        dispatcher,
+        handler,
         pending,
         stdout_bufs,
     };
@@ -260,10 +234,13 @@ impl ParentIo {
                 args,
                 kwargs,
             } => {
-                let dispatcher = self.current_dispatcher();
-                let (output, error) = match dispatcher.dispatch(&name, args, kwargs) {
-                    Ok(output) => (Some(output), None),
-                    Err(error) => (None, Some(error)),
+                let handler = self.current_handler();
+                let (output, error) = match handler {
+                    Some(handler) => match handler(&name, args, kwargs) {
+                        Ok(output) => (Some(output), None),
+                        Err(error) => (None, Some(error)),
+                    },
+                    None => (None, Some("no sandbox run is active".into())),
                 };
                 let sent = ipc::send_parent_msg(
                     &mut self.sock,
@@ -339,12 +316,12 @@ impl ParentIo {
         }
     }
 
-    fn current_dispatcher(&self) -> Arc<dyn ToolDispatcher> {
-        match self.dispatcher.lock() {
-            Ok(guard) => Arc::clone(&guard),
+    fn current_handler(&self) -> Option<Arc<ToolHandler>> {
+        match self.handler.lock() {
+            Ok(guard) => guard.clone(),
             Err(e) => {
-                warn!("sandbox parent io: dispatcher mutex poisoned: {e}");
-                Arc::new(NoopDispatcher)
+                warn!("sandbox parent io: handler mutex poisoned: {e}");
+                None
             }
         }
     }

@@ -12,7 +12,7 @@ use crate::error::SandboxError;
 use crate::ipc::{DirEntry, ParentMsg, ToolResultPayload};
 use crate::lock_or_poisoned;
 use crate::namespace::NamespaceConfig;
-use crate::{ChildIoResult, NoopDispatcher, PendingMap, SandboxResponse, ToolDispatcher};
+use crate::{ChildIoResult, PendingMap, SandboxResponse, ToolHandler};
 
 /// Max wait for long-running requests (code runs, tool calls, execs).
 const RUN_TIMEOUT: Duration = Duration::from_mins(5);
@@ -28,7 +28,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// old child and spawn a new one.
 pub struct Sandbox {
     inner: Mutex<Option<Arc<SandboxInner>>>,
-    dispatcher: Arc<Mutex<Arc<dyn ToolDispatcher>>>,
+    handler: Arc<Mutex<Option<Arc<ToolHandler>>>>,
 }
 
 struct SandboxInner {
@@ -42,20 +42,12 @@ struct SandboxInner {
 impl Sandbox {
     /// Create a new sandbox, spawning a persistent child process.
     ///
-    /// Trusted tools forwarded by the child fail until a dispatcher is
-    /// registered with [`set_dispatcher`](Sandbox::set_dispatcher).
+    /// Trusted tools forwarded by the child fail unless the active
+    /// [`run_code`](Sandbox::run_code) call provides a handler for them.
     pub fn new(config: NamespaceConfig) -> Result<Arc<Self>, SandboxError> {
-        Self::with_dispatcher(config, Arc::new(NoopDispatcher))
-    }
-
-    /// Create a new sandbox with the given tool dispatcher.
-    pub fn with_dispatcher(
-        config: NamespaceConfig,
-        dispatcher: Arc<dyn ToolDispatcher>,
-    ) -> Result<Arc<Self>, SandboxError> {
         let sandbox = Arc::new(Self {
             inner: Mutex::new(None),
-            dispatcher: Arc::new(Mutex::new(dispatcher)),
+            handler: Arc::new(Mutex::new(None)),
         });
         let inner = Self::spawn_inner(&sandbox, &config)?;
         *lock_or_poisoned(&sandbox.inner)? = Some(inner);
@@ -74,7 +66,7 @@ impl Sandbox {
         let io_handle = crate::parent_io_thread(
             sock,
             rx,
-            Arc::clone(&sandbox.dispatcher),
+            Arc::clone(&sandbox.handler),
             pending.clone(),
             stdout_bufs,
         )?;
@@ -91,16 +83,6 @@ impl Sandbox {
         lock_or_poisoned(&self.inner)?
             .clone()
             .ok_or_else(|| SandboxError::Ipc("sandbox not initialized (call reinit first)".into()))
-    }
-
-    /// Register the dispatcher used for trusted tool calls forwarded by the
-    /// child (webfetch, websearch, question, `todo_write`, task, memory, skill,
-    /// index).
-    pub fn set_dispatcher(&self, dispatcher: Arc<dyn ToolDispatcher>) {
-        match lock_or_poisoned(&self.dispatcher) {
-            Ok(mut guard) => *guard = dispatcher,
-            Err(e) => warn!("sandbox: set_dispatcher failed: {e}"),
-        }
     }
 
     /// Tear down the current child and spawn a new one with the given config.
@@ -144,8 +126,27 @@ impl Sandbox {
     /// Run code in the child's interpreter and wait for the result.
     ///
     /// `config` is a serialized `AgentConfig` applied to the child's Lua
-    /// runtime before the run starts.
+    /// runtime before the run starts. Trusted tools the child forwards while
+    /// this run is active are answered by `handler`; calls arriving outside
+    /// a run fail with "no sandbox run is active".
     pub fn run_code(
+        &self,
+        code: String,
+        timeout_secs: u64,
+        max_memory: usize,
+        config: String,
+        handler: impl Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<String, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<ChildIoResult, SandboxError> {
+        let previous = lock_or_poisoned(&self.handler)?.replace(Arc::new(handler));
+        let result = self.run_code_inner(code, timeout_secs, max_memory, config);
+        *lock_or_poisoned(&self.handler)? = previous;
+        result
+    }
+
+    fn run_code_inner(
         &self,
         code: String,
         timeout_secs: u64,
@@ -174,7 +175,8 @@ impl Sandbox {
     /// Execute a tool inside the sandbox namespace.
     ///
     /// Filesystem and bash tools run in the child; trusted tools are
-    /// forwarded to the parent's [`ToolDispatcher`].
+    /// forwarded to the handler of the active
+    /// [`run_code`](Sandbox::run_code) call.
     pub fn call_tool(
         &self,
         name: &str,
@@ -451,7 +453,13 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        let result = match sandbox.run_code("print('sandbox-ok')".into(), 30, 0, "{}".into()) {
+        let result = match sandbox.run_code(
+            "print('sandbox-ok')".into(),
+            30,
+            0,
+            "{}".into(),
+            |name, _, _| Err(format!("no tools in test: {name}")),
+        ) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!("{SKIP_NO_NS}");
