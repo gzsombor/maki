@@ -15,6 +15,12 @@ use crate::ipc::{self, SYNC_GO, SYNC_READY};
 
 pub const DEFAULT_ALLOWED_ENV: &[&str] = &["LANG", "TERM", "TMPDIR", "RUST_LOG"];
 
+/// Flags for every tmpfs mounted inside the sandbox. Explicit `nosuid|nodev`
+/// is required: mounts created without them in a user namespace silently
+/// block opening device nodes bind-mounted on top of them (open fails with
+/// EACCES), which breaks `/dev/null`. Mirrors what bubblewrap does.
+const TMPFS_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
+
 const ENV_DESCRIPTIONS: &[(&str, &str)] = &[
     ("LANG", "locale"),
     ("TERM", "terminal type"),
@@ -337,7 +343,7 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
         Some("tmpfs"),
         staging,
         Some("tmpfs"),
-        MsFlags::empty(),
+        TMPFS_FLAGS,
         None::<&str>,
     )
     .map_err(|e| SandboxError::Mount(format!("mount tmpfs staging: {e}")))?;
@@ -354,13 +360,13 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
             .map_err(|e| SandboxError::Mount(format!("create dir {path}: {e}")))?;
     }
 
-    // Mount tmpfs on /dev, then populate with device nodes
+    // Mount tmpfs on /dev, then populate with device nodes.
     let dev_path = format!("{staging}/dev");
     mount(
         Some("tmpfs"),
         dev_path.as_str(),
         Some("tmpfs"),
-        MsFlags::empty(),
+        TMPFS_FLAGS,
         None::<&str>,
     )
     .map_err(|e| SandboxError::Mount(format!("mount tmpfs /dev: {e}")))?;
@@ -433,7 +439,7 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
         Some("tmpfs"),
         etc_path.as_str(),
         Some("tmpfs"),
-        MsFlags::empty(),
+        TMPFS_FLAGS,
         None::<&str>,
     )
     .map_err(|e| SandboxError::Mount(format!("mount tmpfs /etc: {e}")))?;
@@ -477,7 +483,7 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
         Some("tmpfs"),
         lib64_target.as_str(),
         Some("tmpfs"),
-        MsFlags::empty(),
+        TMPFS_FLAGS,
         None::<&str>,
     )
     .map_err(|e| SandboxError::Mount(format!("mount tmpfs /lib64: {e}")))?;
@@ -539,7 +545,7 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
         Some("tmpfs"),
         format!("{staging}/tmp").as_str(),
         Some("tmpfs"),
-        MsFlags::empty(),
+        TMPFS_FLAGS,
         None::<&str>,
     )
     .map_err(|e| SandboxError::Mount(format!("mount tmpfs /tmp: {e}")))?;
