@@ -170,8 +170,8 @@ pub(crate) fn parent_io_thread(
 impl ParentIo {
     fn run(&mut self) {
         loop {
-            if !self.drain_inbound() {
-                self.fail_all("sandbox ipc socket write failed");
+            if let Err(message) = self.drain_inbound() {
+                self.fail_all(&message);
                 return;
             }
 
@@ -206,23 +206,22 @@ impl ParentIo {
         }
     }
 
-    /// Send queued requests to the child. Returns false when a write fails
-    /// or the caller dropped its end of the queue.
-    fn drain_inbound(&mut self) -> bool {
+    /// Send queued requests to the child. Err carries the message used to
+    /// fail every pending waiter.
+    fn drain_inbound(&mut self) -> Result<(), String> {
         loop {
             match self.inbound.try_recv() {
-                Ok(msg) => match ipc::send_parent_msg(&mut self.sock, &msg) {
-                    Ok(()) => {}
-                    Err(e) => {
+                Ok(msg) => {
+                    if let Err(e) = ipc::send_parent_msg(&mut self.sock, &msg) {
                         warn!("sandbox parent io: send failed: {e}");
-                        return false;
+                        return Err(format!("sandbox ipc socket write failed: {e}"));
                     }
-                },
-                Err(TryRecvError::Empty) => return true,
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
                 Err(TryRecvError::Disconnected) => {
                     debug!("sandbox parent io: inbound queue closed, shutting down");
                     self.fail_all(SHUTDOWN_MSG);
-                    return false;
+                    return Err(SHUTDOWN_MSG.to_string());
                 }
             }
         }

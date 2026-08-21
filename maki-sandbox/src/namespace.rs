@@ -366,6 +366,19 @@ pub fn isolate_mount_ns() -> Result<bool, SandboxError> {
     }
 }
 
+/// Per-child staging root under /tmp, keyed by the child's pid. A fixed
+/// path would let concurrent sandbox children delete each other's
+/// mountpoints mid-setup.
+fn staging_dir(pid: u32) -> String {
+    format!("/tmp/.maki-root-{pid}")
+}
+
+/// Remove the staging tree left behind by an exited child. Its mounts died
+/// with its mount namespace; only plain directories remain on /tmp.
+pub(crate) fn cleanup_staging(pid: Pid) {
+    let _ = std::fs::remove_dir_all(staging_dir(pid.as_raw() as u32));
+}
+
 fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(), SandboxError> {
     if !has_mount_ns {
         warn!("sandbox: no mount namespace, cd to workspace (no fs isolation)");
@@ -384,14 +397,14 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
     .map_err(|e| SandboxError::Mount(format!("make root private: {e}")))?;
     debug!("sandbox: mount tree made private");
 
-    let staging = "/tmp/.maki-root";
-    let _ = std::fs::remove_dir_all(staging);
-    std::fs::create_dir_all(staging)
+    let staging = staging_dir(std::process::id());
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
         .map_err(|e| SandboxError::Mount(format!("create staging {staging}: {e}")))?;
 
     mount(
         Some("tmpfs"),
-        staging,
+        staging.as_str(),
         Some("tmpfs"),
         TMPFS_FLAGS,
         None::<&str>,
@@ -600,9 +613,9 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
     )
     .map_err(|e| SandboxError::Mount(format!("mount tmpfs /tmp: {e}")))?;
 
-    std::env::set_current_dir(staging)
+    std::env::set_current_dir(staging.as_str())
         .map_err(|e| SandboxError::Mount(format!("cd to {staging}: {e}")))?;
-    pivot_root(staging, &old_root)?;
+    pivot_root(staging.as_str(), &old_root)?;
 
     if let Err(e) = umount2("/.old_root", MntFlags::MNT_DETACH) {
         // The host root stays visible inside the sandbox, so isolation is

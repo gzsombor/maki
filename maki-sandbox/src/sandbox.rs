@@ -319,6 +319,7 @@ impl Drop for SandboxInner {
     fn drop(&mut self) {
         let _ = self.tx.send(ParentMsg::Exit);
         let _ = crate::wait_child(self.pid);
+        crate::namespace::cleanup_staging(self.pid);
         if let Some(handle) = self.io_handle.take()
             && handle.join().is_err()
         {
