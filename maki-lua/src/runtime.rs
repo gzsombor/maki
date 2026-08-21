@@ -119,7 +119,8 @@ const SANDBOX_ROUTED_TOOLS: &[&str] = &[
 /// non-object values are passed as a single positional arg.
 fn split_input(input: &Value) -> (Vec<Value>, Vec<(String, Value)>) {
     if let Value::Object(map) = input {
-        let kwargs: Vec<(String, Value)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let kwargs: Vec<(String, Value)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         (Vec::new(), kwargs)
     } else {
         (vec![input.clone()], Vec::new())
@@ -4188,7 +4189,11 @@ mod tests {
                     assert_eq!(kwargs.len(), map.len());
                     for (k, v) in &map {
                         let found = kwargs.iter().find(|(kk, _)| kk == k);
-                        assert_eq!(found.map(|(_, vv)| vv), Some(v), "field {k} missing or mismatched");
+                        assert_eq!(
+                            found.map(|(_, vv)| vv),
+                            Some(v),
+                            "field {k} missing or mismatched"
+                        );
                     }
                 }
                 _ => {
