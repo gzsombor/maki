@@ -1,10 +1,12 @@
 # maki-sandbox
 
-Linux namespace-based sandbox for running untrusted code with filesystem isolation.
+Linux namespace-based sandbox providing process isolation and an IPC transport for running untrusted workloads.
 
 ## Overview
 
-When `sandbox_enabled = true`, code execution runs inside a child process with user and mount namespaces. The child has a minimal, read-only root filesystem built from the host's `/usr`, `/lib`, and `/dev`, with only the workspace directory writable. Filesystem tools (read, write, edit, multiedit, glob, grep, list) run inside the child via a minimal Lua runtime that loads the existing plugins, and `bash` runs inside the child via `fork()+execve()`. Only trusted tools (network, UI, agent state) are forwarded to the parent over IPC.
+`maki-sandbox` owns everything below the workload: user and mount namespaces, a minimal read-only root filesystem built from the host's `/usr`, `/lib`, and `/dev`, a writable workspace bind mount, environment filtering, and a Unix-socket IPC protocol between parent and child.
+
+It deliberately does **not** own an execution engine. What runs inside the child is injected at startup through the [`ChildWorkload`](src/workload.rs) seam (see [Workload injection](#workload-injection)). The default workload -- bash plus Lua-plugin filesystem tools plus trusted-tool forwarding -- lives in the separate `maki-tools` crate, keeping this crate free of mlua, interpreter, and agent dependencies.
 
 ## Process model
 
@@ -13,10 +15,10 @@ When `sandbox_enabled = true`, code execution runs inside a child process with u
  ┌─────────────────────┐           ┌──────────────────────────────────────┐
  │                     │           │                                      │
  │  Sandbox struct     │  socket   │  InnerChild                         │
- │  ├── setup()        │◄─────────►│  ├── recv SetupMessage               │
- │  ├── pwd/ls/cd/exec │           │  ├── run interpreter (or browse loop)│
- │  ├── run_child_io() │           │  ├── forward tool calls via IPC      │
- │  └── wait()         │           │  └── send Done                       │
+ │  ├── ls/pwd/cd/exec │◄─────────►│  ├── build ChildSession (registry)  │
+ │  ├── run_code()     │           │  ├── serve Run on worker thread     │
+ │  ├── call_tool()    │           │  ├── answer ToolCall locally        │
+ │  └── wait()         │           │  └── stream Stdout/Done             │
  │                     │           │                                      │
  └─────────────────────┘           └──────────────────────────────────────┘
           │
@@ -37,11 +39,37 @@ When `sandbox_enabled = true`, code execution runs inside a child process with u
 
 Three processes are involved:
 
-1. **Parent** (`Sandbox` / `ChildIoHandler`) -- the main maki process. Holds the `Sandbox` struct, sends setup/queries over the socket, and runs `run_child_io` in a background thread to dispatch tool calls from the child back to Lua plugins.
+1. **Parent** (`Sandbox`) -- the main maki process. Sends `Run`, queries, and tool calls over the socket; an IO thread (`parent_io_thread`) routes replies and dispatches trusted tool calls forwarded by the child to the handler installed by the active `run_code` call.
 
 2. **Outer child** (`SandboxChild`) -- a short-lived process forked by `spawn_child`. Sets up namespaces, builds the mount tree, does `pivot_root`, then execs `/proc/self/exe --sandbox-inner` so the inner instance starts with a clean process state inside the isolated filesystem. If exec fails, it falls back to running the inner loop in-place.
 
-3. **Inner child** (`InnerChild`) -- the post-exec process that runs inside the isolated root. Receives the `SetupMessage`, runs the monty interpreter (or enters browse-only mode for file browsing/shell), and sends results back over the socket. If the code is empty (browse mode), it responds to `Ls`, `Pwd`, `Cd`, `Exec` queries.
+3. **Inner child** (`InnerChild`) -- the post-exec process that runs inside the isolated root. It builds its `ChildSession` from the workload registry (survives the re-exec because the registry is a process-global in the same binary) and serves it on a worker thread. The IO thread answers `Ls`, `Pwd`, `Cd`, and `Exec` directly, without involving the session.
+
+## Workload injection
+
+The child's execution engine is supplied by the embedding binary via a process-global registry:
+
+```rust
+// once at startup, before any child is forked or re-execed
+maki_sandbox::register_child_workload(Arc::new(MyWorkload));
+```
+
+```rust
+pub trait ChildWorkload: Send + Sync {
+    /// Called once per child process, before any IPC traffic is served.
+    fn init(&self, ctx: ChildCtx) -> Result<Box<dyn ChildSession>, String>;
+}
+
+pub trait ChildSession: Send {
+    fn run_code(&mut self, spec: RunSpec) -> ChildIoResult;
+    fn handle_tool_call(&mut self, name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>)
+        -> Result<String, String>;
+}
+```
+
+- `RunSpec` carries `call_id`, `code`, `timeout_secs`, `max_memory`, and the serialized config JSON.
+- `ChildCtx` is the session's handle back to the outside world: `stream_stdout()` streams run output, `forward_trusted()` runs a tool in the parent over IPC (request/reply with a timeout backstop), and `exec()` runs a shell command inside the isolated filesystem.
+- If no workload is registered (the `sandbox-diag` and `sandbox-shell` binaries don't register one), a fallback `NoWorkloadSession` is used: runs fail lazily with "no child workload registered", while browse queries (`ls`/`pwd`/`cd`/`exec`) still work because they never reach the session.
 
 ## IPC protocol
 
@@ -65,18 +93,22 @@ Parent                          Child
 
 ### Message types
 
+Every request carries a `call_id`; the child echoes it in the matching response so results route by id.
+
 **Parent -> Child** (`ParentMsg`):
-- `ToolResult { call_id, result }` -- response to a tool call
-- `ToolBatchResult { results }` -- batch response
-- `Cancel` -- cancel pending tool calls
+- `Run { call_id, code, timeout_secs, max_memory, config }` -- execute code in the child's workload
+- `ToolCall { call_id, name, args, kwargs }` -- parent-initiated tool call for local execution
+- `ToolResult { call_id, result }` -- reply to a forwarded trusted tool call
+- `Cancel` -- cancel pending forwarded calls
 - `Exit` -- shut down the child
-- `Ls { path }`, `Pwd`, `Cd { path }`, `Exec { command }` -- filesystem queries (browse mode)
+- `Ls { path }`, `Pwd`, `Cd { path }`, `Exec { command }` -- filesystem queries answered by the IO thread
 
 **Child -> Parent** (`ChildMsg`):
-- `Stdout { text }` -- streaming stdout line
-- `ToolCall { call_id, name, args, kwargs }` -- request to run a tool
-- `Done { output, stdout, error }` -- final result
-- `LsResult { entries }`, `PwdResult { path }`, `CdResult`, `ExecResult { output, is_error }` -- query responses
+- `Stdout { call_id, text }` -- streaming stdout chunk
+- `Done { call_id, output, stdout, error }` -- final result of a `Run`
+- `ToolCall { call_id, name, args, kwargs }` -- trusted tool forwarded for parent execution
+- `ToolResult { call_id, result }` -- result of a parent-initiated tool call
+- `LsResult { entries }`, `PwdResult { path }`, `CdResult`, `ExecResult { output, is_error }`
 
 ## Filesystem layout
 
@@ -100,8 +132,6 @@ Inside the mount namespace, the child sees:
 
 Host directories from profiles and `sandbox_allowed_paths` are bind-mounted under `/home/maki/`.
 
-Plugins are embedded in the binary at compile time via `include_dir!` — no filesystem mount is needed. The `ChildLuaRuntime` loads them from the embedded static, falling back to the filesystem if the plugin directory exists (useful for development).
-
 ## Namespace isolation
 
 - **User namespace** (`CLONE_NEWUSER`): maps the current uid/gid to root inside the child. Required for all other namespace operations.
@@ -118,62 +148,29 @@ The child's environment is wiped (`clearenv`) and rebuilt from scratch. Only the
 - Any `LC_*` variables from the host
 - User-specified `sandbox_allowed_env` entries
 
-## Tool dispatch
-
-Tools split into two categories:
-
-- **Sandbox-local tools** (`read`, `write`, `edit`, `multiedit`, `glob`, `grep`, `list`) -- run inside the child via the `ChildLuaRuntime`. The Lua plugins are embedded in the binary at compile time (via `include_dir!`), so no host filesystem mount is needed. Filesystem operations are naturally sandboxed by the mount namespace. `bash` runs inside the child via `fork()+execve()`.
-- **Trusted tools** (`webfetch`, `websearch`, `question`, `todo_write`, `task`, `memory`, `skill`, `index`) -- forwarded to the parent via IPC. These require host resources (network, UI, tree-sitter grammars) not available in the sandbox.
-
-### Child Lua Runtime
-
-The `ChildLuaRuntime` (`lua_runtime.rs`) provides a minimal `maki.*` API surface:
-- `maki.fs.*` -- filesystem operations (sandboxed by mount namespace); `grep` is implemented (not stubbed)
-- `maki.uv.*` -- cwd, os_homedir, os_getenv
-- `maki.fn.*` -- synchronous process execution (jobstart, jobwait, jobstop)
-- `maki.json.*` -- encode/decode
-- `maki.log.*` -- structured logging
-- `maki.split` -- string splitting
-- `maki.ui.*` -- stubs (no terminal in sandbox)
-- `maki.api.register_tool` -- tool registration
-- `maki.api.register_options` -- returns the merged resolved option defaults
-- `maki.treesitter.*` -- stubs
-- `maki.async.run` -- runs inline (no async in child)
-
-Plugins are loaded from the embedded static (`include_dir!("$CARGO_MANIFEST_DIR/../plugins")`). If a filesystem plugin directory exists at the expected path (useful for development), it is used instead. The `require()` function resolves modules from the plugin directory's `lib/` subdirectory or from the embedded sources.
-
-#### Tool context (`ctx`)
-
-Lua tool handlers receive `(input, ctx)`, where `ctx` is a `UserData` exposing the per-tool state the plugins expect:
-
-- `ctx:config(key, default)` -- reads the serialized `AgentConfig` (passed from the parent via `SetupMessage.config`)
-- `ctx:tool_output_lines()` -- per-tool output line limits
-- `ctx:record_read(path)` -- track files read
-- `ctx:check_before_edit(path)` -- stale-read check before edits
-- `ctx:is_instruction_file(name)` -- instruction-file detection
-- `ctx:find_instructions(dir)` -- locate AGENTS.md files (returns `[{path, content}]`)
-
-The `FileReadTracker` is fresh in the child (safe: `check_before_edit` allows untracked files), so no parent state is seeded.
-
 ## Public API
 
 The main entry point is `Sandbox`, an `Arc`-shared handle:
 
 ```rust
-let sandbox = Sandbox::new(config)?;           // fork + namespace setup
-sandbox.setup(&SetupMessage { code, .. })?;    // send code to execute
-let pwd = sandbox.pwd()?;                       // query child state
-let entries = sandbox.ls("/home/maki")?;        // list directory
-sandbox.cd("/tmp")?;                            // change child cwd
-let (out, is_err) = sandbox.exec("echo hi")?;  // run shell command
-sandbox.reinit(new_config)?;                    // tear down + respawn
-sandbox.exit()?;                                // send exit signal
+let sandbox = Sandbox::new(config)?;              // fork + namespace setup
+let out = sandbox.run_code(                       // run code in the child's workload
+    code,
+    timeout_secs,
+    max_memory,
+    config_json,
+    |name, args, kwargs| { /* answer forwarded trusted tools */ },
+)?;
+let result = sandbox.call_tool("bash", args, kwargs)?; // parent-initiated tool call
+let pwd = sandbox.pwd()?;                          // query child state
+let entries = sandbox.ls("/home/maki")?;           // list directory
+sandbox.cd("/tmp")?;                               // change child cwd
+sandbox.reinit(new_config)?;                       // tear down + respawn
+sandbox.exit()?;                                   // send exit signal
 // child is waited on when Sandbox is dropped
 ```
 
-`SetupMessage` carries `code` (empty string = browse mode), `timeout_secs`, `max_memory`, and `config` (the serialized `AgentConfig` JSON the child builds its tool `ctx` from). Browse-mode setups use `SetupMessage::browse()`.
-
-All IPC is serialized through an internal mutex. `reinit` tears down the old child (sends `Exit`, waits) before spawning a new one.
+Trusted tools forwarded by the child are answered by the `handler` closure of the active `run_code` call; calls arriving outside a run fail with "no sandbox run is active". All IPC is serialized through internal mutexes. `reinit` tears down the old child (sends `Exit`, waits) before spawning a new one.
 
 ## Profiles
 
@@ -190,16 +187,16 @@ Use `profiles::build_namespace_config()` to convert enabled profiles into a `Nam
 
 ## Binaries
 
-- `sandbox-shell` -- interactive CLI for testing the sandbox. Supports `--profile`, `--exec-only`, and `--list-profiles` flags.
+- `sandbox-shell` -- interactive CLI for testing the sandbox. Supports `--profile`, `--exec-only`, and `--list-profiles` flags. Runs without a registered workload (browse queries only).
 - `sandbox-diag` -- diagnostic tool that probes namespace support, filesystem layout, and exec behavior to diagnose why sandbox commands may fail.
 
 ## Tests
 
-- `src/child.rs` -- unit tests for `require_str`, `list_dir_entries`
+- `src/child.rs` -- unit tests for `list_dir_entries`
 - `src/ipc.rs` -- roundtrip tests for all IPC message types
 - `src/namespace.rs` -- tests for env computation, path building, linker detection
 - `src/profiles.rs` -- tests for path resolution, profile-to-config conversion
-- `src/sandbox.rs` -- integration tests for `Sandbox` lifecycle (require namespace support)
-- `src/lua_runtime.rs` -- unit tests for `ChildLuaRuntime` (plugin loading, tool registration, fs operations, embedded-plugin read/grep round-trips, tool `ctx` and `register_options`)
 - `tests/browse.rs` -- file browser integration test
 - `tests/exec.rs` -- shell execution integration test
+
+Integration tests that exercise a full code run live in `maki-tools` (`tests/run_code.rs`), since they need a registered workload.
