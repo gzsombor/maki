@@ -171,18 +171,16 @@ impl SandboxChild {
     }
 
     fn run_inner_static() -> ! {
-        let fd: i32 = match std::env::var(ENV_SANDBOX_FD) {
-            Ok(val) => match val.parse() {
-                Ok(fd) => fd,
-                Err(_) => {
-                    eprintln!("MAKI_SANDBOX_FD must be a valid fd number, got: {val}");
-                    std::process::exit(1);
-                }
-            },
-            Err(_) => {
-                eprintln!("MAKI_SANDBOX_FD must be set for sandbox inner instance");
+        let fd: i32 = if let Ok(val) = std::env::var(ENV_SANDBOX_FD) {
+            if let Ok(fd) = val.parse() {
+                fd
+            } else {
+                eprintln!("MAKI_SANDBOX_FD must be a valid fd number, got: {val}");
                 std::process::exit(1);
             }
+        } else {
+            eprintln!("MAKI_SANDBOX_FD must be set for sandbox inner instance");
+            std::process::exit(1);
         };
         unsafe {
             std::env::remove_var(ENV_SANDBOX_FD);
@@ -195,7 +193,7 @@ impl SandboxChild {
 /// Entry point for the sandbox child's first invocation (fork child).
 ///
 /// Sets up namespaces and mounts. When mount namespace is available, it
-/// pivot_roots into the new root and execs `/proc/self/exe --sandbox-inner`
+/// `pivot_roots` into the new root and execs `/proc/self/exe --sandbox-inner`
 /// so the inner instance starts with a clean process state inside the
 /// isolated filesystem. When mount namespace is unavailable, it calls the
 /// inner loop directly (no isolation, no exec).
@@ -739,7 +737,7 @@ fn sandbox_exec(command: &str, workdir: Option<&str>) -> Result<(String, bool), 
                     Err(_) => std::process::exit(127),
                 }
             }
-            let envp: Vec<&CStr> = env_vars.iter().map(|e| e.as_c_str()).collect();
+            let envp: Vec<&CStr> = env_vars.iter().map(std::ffi::CString::as_c_str).collect();
             let _ = execve(c"/usr/bin/sh", &argv[..], &envp[..]);
             std::process::exit(127);
         }
@@ -778,7 +776,7 @@ fn list_dir_entries(path: &str) -> Vec<DirEntry> {
     if let Ok(rd) = std::fs::read_dir(path) {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
             entries.push(DirEntry { name, is_dir });
         }
     }

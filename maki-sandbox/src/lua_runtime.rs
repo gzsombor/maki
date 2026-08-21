@@ -34,14 +34,15 @@ impl ChildLuaRuntime {
     pub fn new(plugin_dir: &Path, config_json: Option<&str>) -> Result<Self, LuaError> {
         let lua = Lua::new();
         create_maki_api(&lua)?;
-        match config_json {
-            Some(json) => match serde_json::from_str::<Value>(json) {
+        if let Some(json) = config_json {
+            match serde_json::from_str::<Value>(json) {
                 Ok(value) => lua
                     .globals()
                     .set(CONFIG_GLOBAL, json_to_lua(&lua, &value)?)?,
                 Err(e) => warn!(error = %e, "lua_runtime: bad config json, defaults apply"),
-            },
-            None => debug!("lua_runtime: no config, defaults apply"),
+            }
+        } else {
+            debug!("lua_runtime: no config, defaults apply");
         }
         setup_require(&lua, plugin_dir.to_path_buf())?;
         load_plugins(&lua, plugin_dir)?;
@@ -399,19 +400,7 @@ fn load_plugins(lua: &Lua, plugin_dir: &Path) -> Result<(), LuaError> {
         debug!("lua_runtime: plugin dir not found, using embedded plugins");
     }
 
-    let subdirs: Vec<(String, PathBuf)> = if !use_embedded {
-        std::fs::read_dir(plugin_dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-                    .map(|e| {
-                        let name = e.file_name().to_string_lossy().to_string();
-                        (name, e.path())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
+    let subdirs: Vec<(String, PathBuf)> = if use_embedded {
         EMBEDDED_PLUGINS
             .dirs()
             .map(|d| {
@@ -423,6 +412,18 @@ fn load_plugins(lua: &Lua, plugin_dir: &Path) -> Result<(), LuaError> {
                 (name, PathBuf::new())
             })
             .collect()
+    } else {
+        std::fs::read_dir(plugin_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
+                    .map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        (name, e.path())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     };
 
     for (name, fs_path) in &subdirs {
@@ -614,9 +615,7 @@ fn fs_abspath(lua: &Lua, path: String) -> LuaResult<LuaValue> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(p))
-            .unwrap_or_else(|_| p.to_path_buf())
+        std::env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
     };
     Ok(LuaValue::String(
         lua.create_string(abs.to_string_lossy().as_bytes())?,
@@ -651,7 +650,7 @@ fn fs_dir(lua: &Lua, path: String) -> LuaResult<LuaMultiValue> {
     let table = lua.create_table()?;
     for (idx, entry) in entries.flatten().enumerate() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
         let kind = if is_dir { "directory" } else { "file" };
         let inner = lua.create_table()?;
         inner.set(1, name)?;

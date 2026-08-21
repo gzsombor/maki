@@ -96,8 +96,7 @@ fn compute_env_entries(
         let description = ENV_DESCRIPTIONS
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, d)| *d)
-            .unwrap_or("");
+            .map_or("", |(_, d)| *d);
         entries.push(EnvEntry {
             key: key.into(),
             value,
@@ -150,6 +149,7 @@ fn compute_env_entries(
 
 impl NamespaceConfig {
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         allowed_env: Vec<String>,
         env_vars: Vec<(String, String)>,
@@ -177,6 +177,7 @@ impl NamespaceConfig {
     /// Compute the full list of env vars that will be available in the sandbox,
     /// including default allow-listed vars, LC_* vars from the host, and
     /// user-specified extras.
+    #[must_use]
     pub fn effective_env(&self) -> Vec<EnvEntry> {
         compute_env_entries(&self.allowed_env, &self.env_vars, &self.path_dirs)
     }
@@ -242,7 +243,7 @@ impl NamespaceConfig {
         self.allowed_env.iter().any(|e| e == key)
     }
 
-    /// Set up bind mounts and pivot_root for filesystem isolation.
+    /// Set up bind mounts and `pivot_root` for filesystem isolation.
     pub fn setup_mounts(&self, has_mount_ns: bool) -> Result<(), SandboxError> {
         setup_mounts_impl(self, has_mount_ns)
     }
@@ -629,7 +630,7 @@ pub fn probe() -> Result<(), SandboxError> {
             let mut buf = [0u8; 1];
             sync_tx.read_exact(&mut buf).ok();
             let ok = unshare(CloneFlags::CLONE_NEWNS).is_ok();
-            std::process::exit(if ok { 0 } else { 1 });
+            std::process::exit(i32::from(!ok));
         }
         ForkResult::Parent { child: child_pid } => {
             drop(sync_tx);
@@ -696,8 +697,7 @@ fn diagnose_mount_ns_blocked() -> String {
     let lockdown_mode = std::fs::read_to_string("/sys/kernel/security/lockdown").ok();
     let in_container = Path::new("/run/.containerenv").exists()
         || std::fs::read_to_string("/proc/1/cgroup")
-            .map(|c| c.contains("docker") || c.contains("lxc") || c.contains("containerd"))
-            .unwrap_or(false);
+            .is_ok_and(|c| c.contains("docker") || c.contains("lxc") || c.contains("containerd"));
 
     if let Some(val) = &apparmor_val
         && val.trim() == "1"
@@ -1180,9 +1180,11 @@ mod tests {
             vec!["/home/maki/.cargo/bin".to_string()],
             "~/.cargo/bin must be on the sandbox PATH via the rust profile"
         );
-        assert!(config
-            .home_mounts
-            .contains(&(tmp.path().join(".cargo"), ".cargo".into())));
+        assert!(
+            config
+                .home_mounts
+                .contains(&(tmp.path().join(".cargo"), ".cargo".into()))
+        );
         assert!(
             config
                 .readonly_mounts

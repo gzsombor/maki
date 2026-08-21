@@ -352,19 +352,18 @@ impl ParentIo {
     /// Wake the waiter registered for `call_id`, if any.
     fn deliver(&self, call_id: u32, response: Result<SandboxResponse, String>) -> bool {
         match self.pending.lock() {
-            Ok(mut pending) => match pending.remove(&call_id) {
-                Some(tx) => {
+            Ok(mut pending) => {
+                if let Some(tx) = pending.remove(&call_id) {
                     if tx.send(response).is_err() {
                         debug!(call_id, "sandbox parent io: waiter gone");
                         return false;
                     }
                     true
-                }
-                None => {
+                } else {
                     debug!(call_id, "sandbox parent io: no pending waiter");
                     false
                 }
-            },
+            }
             Err(e) => {
                 warn!("sandbox parent io: pending mutex poisoned: {e}");
                 false

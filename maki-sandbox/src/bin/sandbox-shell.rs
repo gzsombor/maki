@@ -113,8 +113,7 @@ mod sandbox_impl {
 
         let ws_name = ws_dir
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "sandbox".into());
+            .map_or_else(|| "sandbox".into(), |n| n.to_string_lossy().to_string());
 
         let enabled_profiles_list: Vec<profiles::SandboxProfile> = all_profiles
             .into_iter()
@@ -249,7 +248,7 @@ mod sandbox_impl {
 
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn main() {
-    sandbox_impl::main()
+    sandbox_impl::main();
 }
 
 #[cfg(not(all(feature = "sandbox", target_os = "linux")))]

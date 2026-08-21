@@ -15,7 +15,7 @@ use crate::namespace::NamespaceConfig;
 use crate::{ChildIoResult, NoopDispatcher, PendingMap, SandboxResponse, ToolDispatcher};
 
 /// Max wait for long-running requests (code runs, tool calls, execs).
-const RUN_TIMEOUT: Duration = Duration::from_secs(300);
+const RUN_TIMEOUT: Duration = Duration::from_mins(5);
 /// Max wait for quick queries (ls, pwd, cd).
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -94,7 +94,7 @@ impl Sandbox {
     }
 
     /// Register the dispatcher used for trusted tool calls forwarded by the
-    /// child (webfetch, websearch, question, todo_write, task, memory, skill,
+    /// child (webfetch, websearch, question, `todo_write`, task, memory, skill,
     /// index).
     pub fn set_dispatcher(&self, dispatcher: Arc<dyn ToolDispatcher>) {
         match lock_or_poisoned(&self.dispatcher) {

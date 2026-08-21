@@ -16,6 +16,7 @@ pub enum MountUsage {
 }
 
 impl MountUsage {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Write => "rw",
@@ -34,18 +35,21 @@ pub struct ProfileMount {
 }
 
 impl ProfileMount {
+    #[must_use]
     pub fn rw(path: &str) -> Self {
         Self {
             path: path.into(),
             usage: MountUsage::Write,
         }
     }
+    #[must_use]
     pub fn only_path(path: &str) -> Self {
         Self {
             path: path.into(),
             usage: MountUsage::OnlyPath,
         }
     }
+    #[must_use]
     pub fn read_only(path: &str) -> Self {
         Self {
             path: path.into(),
@@ -54,6 +58,7 @@ impl ProfileMount {
     }
 
     /// Resolve tilde path to an absolute host path.
+    #[must_use]
     pub fn resolved_host_path(&self) -> PathBuf {
         match std::env::var("HOME") {
             Ok(home) => self.resolved_host_path_under(Path::new(&home)),
@@ -70,6 +75,7 @@ impl ProfileMount {
     }
 
     /// Map tilde path to sandbox-internal path (`~/.cargo` → `/home/maki/.cargo`).
+    #[must_use]
     pub fn sandbox_internal_path(&self) -> String {
         if let Some(rest) = self.path.strip_prefix("~/") {
             return format!("/home/maki/{rest}");
@@ -78,6 +84,7 @@ impl ProfileMount {
     }
 
     /// Derive directory name by stripping `~/` prefix (`~/.cargo` → `.cargo`).
+    #[must_use]
     pub fn dir_name(&self) -> String {
         if let Some(rest) = self.path.strip_prefix("~/") {
             return rest.to_string();
@@ -94,6 +101,7 @@ pub struct SandboxProfile {
 }
 
 /// Returns the built-in profiles.
+#[must_use]
 pub fn builtin_profiles() -> Vec<SandboxProfile> {
     vec![
         SandboxProfile {
@@ -178,6 +186,7 @@ pub(crate) fn profile_anchor_under(profile: &SandboxProfile, home: &Path) -> Opt
 ///
 /// Each profile contributes mounts and PATH entries. `extra_home_mounts`
 /// are additional host paths to bind-mount (e.g. from the UI info struct).
+#[must_use]
 pub fn build_namespace_config(
     profiles: &[SandboxProfile],
     workspace_dir: PathBuf,

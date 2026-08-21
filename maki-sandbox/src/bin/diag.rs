@@ -25,9 +25,7 @@ mod sandbox_impl {
     pub fn main() {
         let ws_dir = std::env::current_dir().expect("cwd");
         let ws_name = ws_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "diag".into());
+            .file_name().map_or_else(|| "diag".into(), |n| n.to_string_lossy().to_string());
 
         eprintln!("=== sandbox-diag ===");
         eprintln!(
@@ -181,7 +179,7 @@ mod sandbox_impl {
                             "  status={}, stdout={stdout:?}, stderr={stderr:?}",
                             out.status
                         );
-                        std::process::exit(if out.status.success() { 0 } else { 1 });
+                        std::process::exit(i32::from(!out.status.success()));
                     }
                     Err(e) => {
                         eprintln!("  FAILED: {e}");
@@ -246,7 +244,7 @@ mod sandbox_impl {
     }
 
     /// Test 8: Exact sandbox child setup + direct exec probe.
-    /// Replicates what child_main + child_inner_loop does, but probes exec
+    /// Replicates what `child_main` + `child_inner_loop` does, but probes exec
     /// directly instead of through IPC, to isolate the failure point.
     fn test_sandbox_exec_probe() {
         eprintln!("[8/8] Sandbox inline exec probe...");
@@ -290,9 +288,7 @@ mod sandbox_impl {
                 // 5. setup_mounts (pivot_root + bind mounts)
                 let ws_dir = std::env::current_dir().expect("cwd");
                 let ws_name = ws_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "diag".into());
+                    .file_name().map_or_else(|| "diag".into(), |n| n.to_string_lossy().to_string());
                 let config2 = NamespaceConfig::new(
                     vec![],
                     vec![],
@@ -305,7 +301,7 @@ mod sandbox_impl {
                     vec![],
                 );
                 match config2.setup_mounts(has_mount_ns) {
-                    Ok(_) => eprintln!("  setup_mounts OK"),
+                    Ok(()) => eprintln!("  setup_mounts OK"),
                     Err(e) => {
                         eprintln!("  setup_mounts FAILED: {e}");
                         std::process::exit(1);
@@ -319,7 +315,7 @@ mod sandbox_impl {
                 for path in &["/", "/bin", "/bin/sh", "/usr/bin/sh", "/usr"] {
                     match std::fs::metadata(path) {
                         Ok(m) => {
-                            eprintln!("  stat {path}: OK (len={}, is_dir={})", m.len(), m.is_dir())
+                            eprintln!("  stat {path}: OK (len={}, is_dir={})", m.len(), m.is_dir());
                         }
                         Err(e) => eprintln!("  stat {path}: FAILED ({e})"),
                     }
@@ -516,7 +512,7 @@ mod sandbox_impl {
 
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn main() {
-    sandbox_impl::main()
+    sandbox_impl::main();
 }
 
 #[cfg(not(all(feature = "sandbox", target_os = "linux")))]
