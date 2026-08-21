@@ -25,7 +25,8 @@ mod sandbox_impl {
     pub fn main() {
         let ws_dir = std::env::current_dir().expect("cwd");
         let ws_name = ws_dir
-            .file_name().map_or_else(|| "diag".into(), |n| n.to_string_lossy().to_string());
+            .file_name()
+            .map_or_else(|| "diag".into(), |n| n.to_string_lossy().to_string());
 
         eprintln!("=== sandbox-diag ===");
         eprintln!(
@@ -288,7 +289,8 @@ mod sandbox_impl {
                 // 5. setup_mounts (pivot_root + bind mounts)
                 let ws_dir = std::env::current_dir().expect("cwd");
                 let ws_name = ws_dir
-                    .file_name().map_or_else(|| "diag".into(), |n| n.to_string_lossy().to_string());
+                    .file_name()
+                    .map_or_else(|| "diag".into(), |n| n.to_string_lossy().to_string());
                 let config2 = NamespaceConfig::new(
                     vec![],
                     vec![],
