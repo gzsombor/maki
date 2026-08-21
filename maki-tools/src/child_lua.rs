@@ -31,21 +31,9 @@ pub struct ChildLuaRuntime {
 }
 
 impl ChildLuaRuntime {
-    /// `config_json` is the parent's serialized `AgentConfig`; the child's
-    /// tool ctx reads limits and toggles from it.
-    pub fn new(plugin_dir: &Path, config_json: Option<&str>) -> Result<Self, LuaError> {
+    pub fn new(plugin_dir: &Path) -> Result<Self, LuaError> {
         let lua = Lua::new();
         create_maki_api(&lua)?;
-        if let Some(json) = config_json {
-            match serde_json::from_str::<Value>(json) {
-                Ok(value) => lua
-                    .globals()
-                    .set(CONFIG_GLOBAL, json_to_lua(&lua, &value)?)?,
-                Err(e) => warn!(error = %e, "lua_runtime: bad config json, defaults apply"),
-            }
-        } else {
-            debug!("lua_runtime: no config, defaults apply");
-        }
         setup_require(&lua, plugin_dir.to_path_buf())?;
         load_plugins(&lua, plugin_dir)?;
         Ok(Self {
@@ -1063,7 +1051,7 @@ mod tests {
     #[test]
     fn empty_plugin_dir_loads_cleanly() {
         let dir = tmp_plugin_dir();
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         // No tools registered
         let err = rt.call_tool("read", &[], &[]).unwrap_err();
         assert!(err.contains("not found"));
@@ -1088,7 +1076,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (output, is_error) = rt
             .call_tool("echo", &[], &[("text".into(), json!("hello"))])
             .unwrap();
@@ -1115,7 +1103,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (output, is_error) = rt.call_tool("t", &[], &[]).unwrap();
         assert_eq!(output, "ok");
         assert!(!is_error);
@@ -1140,7 +1128,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (output, is_error) = rt.call_tool("e", &[], &[]).unwrap();
         assert_eq!(output, "something went wrong");
         assert!(is_error);
@@ -1172,7 +1160,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (output, _) = rt
             .call_tool(
                 "reader",
@@ -1203,7 +1191,7 @@ mod tests {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (output, _) = rt.call_tool("spliter", &[], &[]).unwrap();
         assert_eq!(output, "a|b|c");
     }
@@ -1217,7 +1205,9 @@ mod embedded_plugins {
     const AGENT_CONFIG_JSON: &str = r#"{"max_output_lines":2000,"max_output_bytes":51200,"stale_read_check":true,"tool_output_lines":{"bash":5,"code_execution":5,"task":5,"index":3,"grep":3,"read":3,"write":7,"web":3,"other":3}}"#;
 
     fn embedded_runtime() -> ChildLuaRuntime {
-        ChildLuaRuntime::new(Path::new(MISSING_PLUGIN_DIR), Some(AGENT_CONFIG_JSON)).unwrap()
+        let rt = ChildLuaRuntime::new(Path::new(MISSING_PLUGIN_DIR)).unwrap();
+        rt.set_config(AGENT_CONFIG_JSON).unwrap();
+        rt
     }
 
     #[test]
@@ -1308,7 +1298,8 @@ mod embedded_plugins {
         let file = dir.path().join("target.txt");
         std::fs::write(&file, "hello").unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), Some(AGENT_CONFIG_JSON)).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
+        rt.set_config(AGENT_CONFIG_JSON).unwrap();
         let (out, err) = rt
             .call_tool(
                 "probe",
@@ -1343,7 +1334,7 @@ mod embedded_plugins {
         )
         .unwrap();
 
-        let rt = ChildLuaRuntime::new(dir.path(), None).unwrap();
+        let rt = ChildLuaRuntime::new(dir.path()).unwrap();
         let (out, err) = rt.call_tool("opts_probe", &[], &[]).unwrap();
         assert!(!err, "{out}");
         assert_eq!(out, "42|nil");

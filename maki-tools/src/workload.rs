@@ -47,7 +47,7 @@ struct MakiChildWorkload;
 impl ChildWorkload for MakiChildWorkload {
     fn init(&self, ctx: ChildCtx) -> Result<Box<dyn ChildSession>, String> {
         let plugin_dir = Path::new("/home/maki/.maki/plugins");
-        let lua_runtime = match ChildLuaRuntime::new(plugin_dir, None) {
+        let lua_runtime = match ChildLuaRuntime::new(plugin_dir) {
             Ok(rt) => Some(Arc::new(rt)),
             Err(e) => {
                 warn!(error = %e, "sandbox child: lua runtime init failed, filesystem tools unavailable");
