@@ -292,10 +292,22 @@ impl InnerChild {
             std::process::exit(1);
         }
 
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("sandbox-io".into())
             .spawn(move || IoHandler::run(io_sock, outgoing_rx, dispatch, work_tx))
-            .expect("spawn sandbox-io thread");
+        {
+            error!("sandbox child: io thread spawn failed: {e}");
+            let _ = ipc::send_child_msg(
+                &mut self.sock,
+                &ChildMsg::Done {
+                    call_id: NO_CALL_ID,
+                    output: None,
+                    stdout: String::new(),
+                    error: Some(format!("io thread spawn failed: {e}")),
+                },
+            );
+            std::process::exit(1);
+        }
 
         Self::worker_loop(work_rx, outgoing_tx, tools, lua_runtime);
         std::process::exit(0);
