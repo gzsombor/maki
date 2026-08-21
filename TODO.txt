@@ -1,9 +1,0 @@
-Do not mount /etc fully
-When a specific sub directory is requested by a profile to be mounted, 
- so for example ~/.local/maki and no ~/.local folder exists, 
- let's create it and bind mount that maki folder into
-Allow to switch on/off the sandbox from the UI (it needs to validate that the kernel supports the sandbox if needed)
-Add ability to add extra directories to the workspaces, so the user can specify that '~/src/secrets/my-super-project' should also appear under ~/workspace/my-super-workspace (next to the already existing project folder)
-The sandbox setting should be saved to the project's maki configuration.
-
- 
