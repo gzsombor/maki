@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use maki_agent::AgentConfig;
 use maki_sandbox::Sandbox;
+use maki_sandbox::ipc::DirEntry;
 use maki_sandbox::namespace::{EnvEntry, NamespaceConfig};
 use maki_sandbox::profiles::{self, MountUsage, SandboxProfile};
 
@@ -40,10 +41,45 @@ enum InfoFocus {
     Profile(usize),
 }
 
+/// Directory listing delivered by a background job.
+pub(crate) struct DirSnapshot {
+    pub pwd: String,
+    pub entries: Result<Vec<DirEntry>, String>,
+}
+
+/// Event produced by a background sandbox job and applied on the UI thread.
+pub(crate) enum SandboxModalEvent {
+    /// Browse tab requested a fresh child; carries the initial listing.
+    BrowserReady(DirSnapshot),
+    /// A cd+ls round-trip finished for the open browser.
+    Navigated(DirSnapshot),
+    /// Shell tab requested a fresh child; carries the working directory.
+    ShellReady(String),
+    /// A shell command finished.
+    Executed {
+        command: String,
+        result: Result<(String, bool), String>,
+    },
+    /// Child respawn or setup failed.
+    Failed(String),
+}
+
+/// Long-running modal job tracked so late key presses don't stack requests
+/// and stale replies can be recognized.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PendingJob {
+    Browser,
+    Navigate,
+    Shell,
+}
+
 /// Snapshot of sandbox configuration for display.
 pub struct SandboxInfo {
     pub enabled: bool,
     pub env_entries: Vec<EnvEntry>,
+    /// User-configured environment allow list, kept separate so profile
+    /// toggling can rebuild `env_entries` without losing it.
+    pub allowed_env: Vec<String>,
     pub workspace_dir: String,
     pub workspace_name: String,
     pub home_mounts: Vec<(String, String)>,
@@ -58,13 +94,9 @@ struct FileEntry {
     is_dir: bool,
 }
 
-/// Sandbox filesystem browser that talks to a sandbox child process via IPC.
-///
-/// On creation it spawns a browse-only sandbox child (empty code = no interpreter).
-/// Navigation (enter, go_up) sends Ls queries over the Unix socket.
-/// On drop it sends Exit and waits for the child.
+/// Sandbox filesystem browser state. All IPC happens in background jobs;
+/// this struct only holds the last applied listing for rendering.
 struct SandboxFileBrowser {
-    sandbox: Arc<Sandbox>,
     cwd: String,
     entries: Vec<FileEntry>,
     cursor: usize,
@@ -74,37 +106,27 @@ struct SandboxFileBrowser {
 }
 
 impl SandboxFileBrowser {
-    fn new(sandbox: Arc<Sandbox>) -> Result<Self, String> {
-        let pwd = sandbox.pwd().map_err(|e| e.to_string())?;
+    fn new(pwd: String, entries: Vec<DirEntry>) -> Self {
         let mut browser = Self {
             cwd: pwd,
-            sandbox,
             entries: Vec::new(),
             cursor: 0,
             scroll: 0,
             viewport_entries: 0,
             error: None,
         };
-        browser.refresh();
-        Ok(browser)
+        browser.apply_listing(entries);
+        browser
     }
 
-    fn refresh(&mut self) {
-        let result = self.sandbox.ls(&self.cwd);
+    /// Replace the listing after a successful cd+ls round-trip.
+    fn apply_listing(&mut self, listed: Vec<DirEntry>) {
         self.entries.clear();
-        match result {
-            Ok(entries) => {
-                self.error = None;
-                for e in entries {
-                    self.entries.push(FileEntry {
-                        name: e.name,
-                        is_dir: e.is_dir,
-                    });
-                }
-            }
-            Err(e) => {
-                self.error = Some(e.to_string());
-            }
+        for e in listed {
+            self.entries.push(FileEntry {
+                name: e.name,
+                is_dir: e.is_dir,
+            });
         }
         self.entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
@@ -120,8 +142,8 @@ impl SandboxFileBrowser {
                 },
             );
         }
-        let max = self.entries.len().saturating_sub(1);
-        self.cursor = self.cursor.min(max);
+        self.cursor = 0;
+        self.scroll = 0;
     }
 
     fn clamp_cursor(&mut self) {
@@ -152,46 +174,6 @@ impl SandboxFileBrowser {
     fn total_entries(&self) -> usize {
         self.entries.len()
     }
-
-    fn enter(&mut self) {
-        let Some(entry) = self.entries.get(self.cursor) else {
-            return;
-        };
-        if entry.name == ".." {
-            let parent = parent_dir(&self.cwd).unwrap_or_else(|| "/".into());
-            if let Err(e) = self.sandbox.cd(&parent) {
-                self.error = Some(e.to_string());
-                return;
-            }
-            self.cwd = parent;
-        } else if entry.is_dir {
-            let sep = if self.cwd.ends_with('/') { "" } else { "/" };
-            let target = format!("{}{}{}", self.cwd, sep, entry.name);
-            if let Err(e) = self.sandbox.cd(&target) {
-                self.error = Some(e.to_string());
-                return;
-            }
-            self.cwd = target;
-        } else {
-            return;
-        }
-        self.cursor = 0;
-        self.scroll = 0;
-        self.refresh();
-    }
-
-    fn go_up(&mut self) {
-        if let Some(parent) = parent_dir(&self.cwd) {
-            if let Err(e) = self.sandbox.cd(&parent) {
-                self.error = Some(e.to_string());
-                return;
-            }
-            self.cwd = parent;
-            self.cursor = 0;
-            self.scroll = 0;
-            self.refresh();
-        }
-    }
 }
 
 fn parent_dir(path: &str) -> Option<String> {
@@ -214,13 +196,9 @@ struct ShellEntry {
     is_error: bool,
 }
 
-/// Sandbox interactive shell that talks to a sandbox child via IPC.
-///
-/// On creation it spawns a browse-only sandbox child (empty code = no interpreter).
-/// Each command is sent as an Exec IPC message and the output is collected.
-/// On drop it sends Exit and waits for the child.
+/// Sandbox interactive shell state. Commands run in background jobs; results
+/// arrive via [`SandboxModalEvent::Executed`].
 struct SandboxShellState {
-    sandbox: Arc<Sandbox>,
     cwd: String,
     input: String,
     entries: Vec<ShellEntry>,
@@ -230,43 +208,41 @@ struct SandboxShellState {
 }
 
 impl SandboxShellState {
-    fn new(sandbox: Arc<Sandbox>) -> Result<Self, String> {
-        let init_cwd = sandbox.pwd().unwrap_or_default();
-        Ok(Self {
-            sandbox,
-            cwd: init_cwd,
+    fn new(pwd: String) -> Self {
+        Self {
+            cwd: pwd,
             input: String::new(),
             entries: Vec::new(),
             history: Vec::new(),
             history_pos: None,
             error: None,
-        })
+        }
     }
 
-    fn exec(&mut self, command: &str) {
-        match self.sandbox.exec(command) {
+    fn push_result(&mut self, command: String, result: Result<(String, bool), String>) {
+        match result {
             Ok((output, is_error)) => {
                 self.error = None;
                 self.entries.push(ShellEntry {
-                    command: command.to_string(),
+                    command,
                     output,
                     is_error,
                 });
             }
             Err(e) => {
-                self.error = Some(e.to_string());
+                self.error = Some(e);
             }
         }
     }
 
-    fn submit(&mut self) {
+    fn submit(&mut self) -> Option<String> {
         let command = std::mem::take(&mut self.input);
         if command.is_empty() {
-            return;
+            return None;
         }
         self.history.push(command.clone());
         self.history_pos = None;
-        self.exec(&command);
+        Some(command)
     }
 
     fn history_up(&mut self) {
@@ -306,6 +282,9 @@ pub struct SandboxModal {
     browser: Option<SandboxFileBrowser>,
     shell: Option<SandboxShellState>,
     shell_entry_count: usize,
+    /// In-flight spawn/navigate job; execs run untracked.
+    pending: Option<PendingJob>,
+    event_tx: Option<flume::Sender<SandboxModalEvent>>,
     info_focus: Option<InfoFocus>,
     spawn_error: Option<String>,
     /// Set when the user toggles `enabled` via the UI.
@@ -330,6 +309,8 @@ impl SandboxModal {
             browser: None,
             shell: None,
             shell_entry_count: 0,
+            pending: None,
+            event_tx: None,
             info_focus,
             spawn_error: None,
             enabled_changed: false,
@@ -339,8 +320,14 @@ impl SandboxModal {
     }
 
     /// Build the modal from the agent config, deriving the namespace
-    /// layout (mounts, env) shown on the info tab.
-    pub fn from_config(config: &AgentConfig, sandbox: Option<Arc<Sandbox>>) -> Self {
+    /// layout (mounts, env) shown on the info tab. `event_tx` receives
+    /// results from background jobs; it is wired into the session's event
+    /// loop by the caller.
+    pub fn from_config(
+        config: &AgentConfig,
+        sandbox: Option<Arc<Sandbox>>,
+        event_tx: flume::Sender<SandboxModalEvent>,
+    ) -> Self {
         let workspace_dir = std::env::current_dir().ok();
         let workspace_name = workspace_dir
             .as_ref()
@@ -364,10 +351,11 @@ impl SandboxModal {
             .map(|(p, name)| (p.display().to_string(), name.clone()))
             .collect();
         let env_entries = ns_config.effective_env();
-        Self::new(
+        let mut modal = Self::new(
             SandboxInfo {
                 enabled: config.sandbox_enabled,
                 env_entries,
+                allowed_env: config.sandbox_allowed_env.clone(),
                 workspace_dir: workspace_dir
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -381,7 +369,9 @@ impl SandboxModal {
                 extra_workspace_dirs,
             },
             sandbox,
-        )
+        );
+        modal.event_tx = Some(event_tx);
+        modal
     }
 
     pub fn is_open(&self) -> bool {
@@ -398,6 +388,7 @@ impl SandboxModal {
             self.mode = Mode::Info;
             self.close_browser();
             self.close_shell();
+            self.pending = None;
             self.spawn_error = None;
             self.enabled_changed = false;
             self.yolo_changed = false;
@@ -539,6 +530,7 @@ impl SandboxModal {
         self.open = false;
         self.close_browser();
         self.close_shell();
+        self.pending = None;
         self.spawn_error = None;
         self.scroll.reset();
         self.info_focus = None;
@@ -564,7 +556,7 @@ impl SandboxModal {
             .map(|m| m.sandbox_internal_path())
             .collect();
         let cfg = NamespaceConfig::new(
-            vec![],
+            self.info.allowed_env.clone(),
             vec![],
             std::path::PathBuf::new(),
             String::new(),
@@ -592,56 +584,156 @@ impl SandboxModal {
     }
 
     fn spawn_browser(&mut self) {
-        if self.browser.is_some() {
+        if self.browser.is_some() || self.pending.is_some() {
             return;
         }
         self.close_shell();
-        let Some(sandbox) = self.sandbox.as_ref() else {
-            self.spawn_error = Some("sandbox not available".into());
-            return;
-        };
-        let config = self.build_namespace_config();
-        if let Err(e) = sandbox.reinit(config) {
-            tracing::error!(error = %e, "failed to reinit sandbox for browser");
-            self.spawn_error = Some(e.to_string());
-            return;
-        }
-        match SandboxFileBrowser::new(Arc::clone(sandbox)) {
-            Ok(browser) => {
-                self.browser = Some(browser);
-                self.spawn_error = None;
+        self.request_child(PendingJob::Browser, |sandbox| match sandbox.pwd() {
+            Ok(pwd) => {
+                let entries = sandbox.ls(&pwd).map_err(|e| e.to_string());
+                SandboxModalEvent::BrowserReady(DirSnapshot { pwd, entries })
             }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to spawn sandbox browser");
-                self.spawn_error = Some(e);
-            }
-        }
+            Err(e) => SandboxModalEvent::Failed(e.to_string()),
+        });
     }
 
     fn spawn_shell(&mut self) {
-        if self.shell.is_some() {
+        if self.shell.is_some() || self.pending.is_some() {
             return;
         }
         self.close_browser();
         self.shell_entry_count = 0;
-        let Some(sandbox) = self.sandbox.as_ref() else {
+        self.request_child(PendingJob::Shell, |sandbox| {
+            SandboxModalEvent::ShellReady(sandbox.pwd().unwrap_or_default())
+        });
+    }
+
+    /// Reinit the sandbox child with the modal's config on a blocking thread,
+    /// then run `query` against it and deliver the result to the UI thread.
+    fn request_child(
+        &mut self,
+        job: PendingJob,
+        query: impl FnOnce(&Sandbox) -> SandboxModalEvent + Send + 'static,
+    ) {
+        let Some(tx) = self.event_tx.clone() else {
+            self.spawn_error = Some("sandbox event channel unavailable".into());
+            return;
+        };
+        let Some(sandbox) = self.sandbox.clone() else {
             self.spawn_error = Some("sandbox not available".into());
             return;
         };
         let config = self.build_namespace_config();
-        if let Err(e) = sandbox.reinit(config) {
-            tracing::error!(error = %e, "failed to reinit sandbox for shell");
-            self.spawn_error = Some(e.to_string());
+        self.pending = Some(job);
+        smol::unblock(move || {
+            if let Err(e) = sandbox.reinit(config) {
+                tracing::error!(error = %e, "failed to reinit sandbox for modal");
+                let _ = tx.send(SandboxModalEvent::Failed(e.to_string()));
+                return;
+            }
+            let _ = tx.send(query(&sandbox));
+        })
+        .detach();
+    }
+
+    /// cd to `target` and refresh the listing, off the UI thread.
+    fn navigate(&mut self, target: String) {
+        if self.pending.is_some() {
             return;
         }
-        match SandboxShellState::new(Arc::clone(sandbox)) {
-            Ok(shell) => {
-                self.shell = Some(shell);
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let Some(sandbox) = self.sandbox.clone() else {
+            return;
+        };
+        let fallback_cwd = match &self.browser {
+            Some(b) => b.cwd.clone(),
+            None => return,
+        };
+        self.pending = Some(PendingJob::Navigate);
+        smol::unblock(move || {
+            if let Err(e) = sandbox.cd(&target) {
+                let _ = tx.send(SandboxModalEvent::Navigated(DirSnapshot {
+                    pwd: fallback_cwd,
+                    entries: Err(e.to_string()),
+                }));
+                return;
+            }
+            let pwd = sandbox.pwd().unwrap_or(fallback_cwd);
+            let entries = sandbox.ls(&pwd).map_err(|e| e.to_string());
+            let _ = tx.send(SandboxModalEvent::Navigated(DirSnapshot { pwd, entries }));
+        })
+        .detach();
+    }
+
+    /// Run a shell command off the UI thread. Unlike spawns and navigations,
+    /// execs are untracked: several may be in flight and results append in
+    /// arrival order.
+    fn exec_command(&mut self, command: String) {
+        let (Some(tx), Some(sandbox)) = (self.event_tx.clone(), self.sandbox.clone()) else {
+            if let Some(shell) = &mut self.shell {
+                shell.error = Some("sandbox unavailable".into());
+            }
+            return;
+        };
+        smol::unblock(move || {
+            let result = sandbox.exec(&command).map_err(|e| e.to_string());
+            let _ = tx.send(SandboxModalEvent::Executed { command, result });
+        })
+        .detach();
+    }
+
+    /// Apply a finished background job to the modal state. Stale events
+    /// (job superseded by a tab switch or a newer navigation) are dropped.
+    pub(crate) fn apply(&mut self, event: SandboxModalEvent) {
+        match event {
+            SandboxModalEvent::BrowserReady(snapshot) => {
+                if self.pending != Some(PendingJob::Browser) || self.mode != Mode::Browse {
+                    return;
+                }
+                self.pending = None;
+                match snapshot.entries {
+                    Ok(entries) => {
+                        self.spawn_error = None;
+                        self.browser = Some(SandboxFileBrowser::new(snapshot.pwd, entries));
+                    }
+                    Err(e) => self.spawn_error = Some(e),
+                }
+            }
+            SandboxModalEvent::Navigated(snapshot) => {
+                if self.pending != Some(PendingJob::Navigate) {
+                    return;
+                }
+                self.pending = None;
+                let Some(browser) = &mut self.browser else {
+                    return;
+                };
+                browser.cwd = snapshot.pwd;
+                match snapshot.entries {
+                    Ok(entries) => {
+                        browser.error = None;
+                        browser.apply_listing(entries);
+                    }
+                    Err(e) => browser.error = Some(e),
+                }
+            }
+            SandboxModalEvent::ShellReady(pwd) => {
+                if self.pending != Some(PendingJob::Shell) || self.mode != Mode::Shell {
+                    return;
+                }
+                self.pending = None;
+                self.shell = Some(SandboxShellState::new(pwd));
                 self.spawn_error = None;
             }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to spawn sandbox shell");
-                self.spawn_error = Some(e);
+            SandboxModalEvent::Failed(error) => {
+                self.pending = None;
+                self.spawn_error = Some(error);
+            }
+            SandboxModalEvent::Executed { command, result } => {
+                if let Some(shell) = &mut self.shell {
+                    shell.push_result(command, result);
+                }
             }
         }
     }
@@ -747,11 +839,23 @@ impl SandboxModal {
         };
         match key_event.code {
             KeyCode::Enter | KeyCode::Right => {
-                browser.enter();
+                let target = match browser.entries.get(browser.cursor) {
+                    Some(entry) if entry.name == ".." => {
+                        parent_dir(&browser.cwd).unwrap_or_else(|| "/".into())
+                    }
+                    Some(entry) if entry.is_dir => {
+                        let sep = if browser.cwd.ends_with('/') { "" } else { "/" };
+                        format!("{}{}{}", browser.cwd, sep, entry.name)
+                    }
+                    _ => return true,
+                };
+                self.navigate(target);
                 true
             }
             KeyCode::Backspace | KeyCode::Left => {
-                browser.go_up();
+                if let Some(parent) = parent_dir(&browser.cwd) {
+                    self.navigate(parent);
+                }
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -779,9 +883,11 @@ impl SandboxModal {
         };
         match key_event.code {
             KeyCode::Enter => {
-                shell.submit();
-                self.scroll.scroll_to_bottom();
-                self.h_scroll = 0;
+                if let Some(command) = shell.submit() {
+                    self.exec_command(command);
+                    self.scroll.scroll_to_bottom();
+                    self.h_scroll = 0;
+                }
                 true
             }
             KeyCode::Up => {
@@ -820,18 +926,23 @@ impl SandboxModal {
         if !self.open || self.mode != Mode::Shell {
             return false;
         }
+        let mut submitted = Vec::new();
         if let Some(shell) = &mut self.shell {
             for ch in text.chars() {
                 if ch == '\n' || ch == '\r' {
-                    shell.submit();
+                    if let Some(command) = shell.submit() {
+                        submitted.push(command);
+                    }
                     self.scroll.scroll_to_bottom();
                 } else {
                     shell.input.push(ch);
                 }
             }
-            return true;
         }
-        false
+        for command in submitted {
+            self.exec_command(command);
+        }
+        self.shell.is_some()
     }
 
     fn render_info(&mut self, lines: &mut Vec<Line>) {
@@ -1275,6 +1386,7 @@ mod tests {
         SandboxInfo {
             enabled: false,
             env_entries: vec![],
+            allowed_env: vec![],
             workspace_dir: "/tmp".into(),
             workspace_name: "tmp".into(),
             home_mounts: vec![],
@@ -1319,6 +1431,7 @@ mod tests {
             SandboxInfo {
                 enabled: true,
                 env_entries: vec![],
+                allowed_env: vec![],
                 workspace_dir: "/tmp".into(),
                 workspace_name: "tmp".into(),
                 home_mounts: vec![],
@@ -1347,6 +1460,7 @@ mod tests {
         SandboxInfo {
             enabled,
             env_entries: vec![],
+            allowed_env: vec![],
             workspace_dir: "/tmp".into(),
             workspace_name: "tmp".into(),
             home_mounts: vec![],
@@ -1417,6 +1531,7 @@ mod tests {
             SandboxInfo {
                 enabled: true,
                 env_entries: vec![],
+                allowed_env: vec![],
                 workspace_dir: "/tmp".into(),
                 workspace_name: "tmp".into(),
                 home_mounts: vec![],
@@ -1436,5 +1551,114 @@ mod tests {
         // Shell -> Info
         modal.handle_key(key_ev(KeyCode::Tab));
         assert_eq!(modal.mode, Mode::Info);
+    }
+
+    fn dir(name: &str, is_dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.into(),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn browser_ready_applies_only_with_pending_job() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        modal.mode = Mode::Browse;
+        let event = |entries| {
+            SandboxModalEvent::BrowserReady(DirSnapshot {
+                pwd: "/".into(),
+                entries: Ok(entries),
+            })
+        };
+        modal.apply(event(vec![dir("tmp", true)]));
+        assert!(
+            modal.browser.is_none(),
+            "event without a pending job must be dropped"
+        );
+        modal.pending = Some(PendingJob::Browser);
+        modal.apply(event(vec![]));
+        let browser = modal.browser.expect("pending spawn should apply");
+        assert_eq!(browser.cwd, "/");
+        assert!(browser.entries.is_empty());
+    }
+
+    #[test]
+    fn navigated_event_replaces_listing_and_resets_cursor() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        modal.pending = Some(PendingJob::Navigate);
+        modal.browser = Some(SandboxFileBrowser::new("/".into(), vec![dir("tmp", true)]));
+        modal.browser.as_mut().unwrap().cursor = 5;
+
+        modal.apply(SandboxModalEvent::Navigated(DirSnapshot {
+            pwd: "/tmp".into(),
+            entries: Ok(vec![dir("a", false), dir("b", true)]),
+        }));
+        let browser = modal.browser.expect("browser stays open");
+        assert_eq!(browser.cwd, "/tmp");
+        assert_eq!(browser.cursor, 0, "navigation resets the cursor");
+        let names: Vec<&str> = browser.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["..", "b", "a"], "dirs first, then .. prepended");
+    }
+
+    #[test]
+    fn navigated_error_keeps_old_listing() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        modal.pending = Some(PendingJob::Navigate);
+        modal.browser = Some(SandboxFileBrowser::new(
+            "/tmp".into(),
+            vec![dir("keep", false)],
+        ));
+
+        modal.apply(SandboxModalEvent::Navigated(DirSnapshot {
+            pwd: "/tmp".into(),
+            entries: Err("cd failed".into()),
+        }));
+        let browser = modal.browser.expect("browser stays open");
+        assert_eq!(browser.cwd, "/tmp", "failed cd keeps the directory");
+        assert_eq!(
+            browser.error.as_deref(),
+            Some("cd failed"),
+            "the error is surfaced"
+        );
+        assert_eq!(browser.total_entries(), 2, ".. plus original entry kept");
+    }
+
+    #[test]
+    fn shell_executed_event_appends_entry_and_clears_error() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        modal.mode = Mode::Shell;
+        modal.shell = Some(SandboxShellState::new("/".into()));
+        modal.shell.as_mut().unwrap().input.push_str("echo hi");
+        modal.handle_key(key_ev(KeyCode::Enter));
+        let shell = modal.shell.as_ref().unwrap();
+        assert_eq!(shell.history, ["echo hi"]);
+        assert_eq!(shell.input, "", "input is cleared on submit");
+
+        modal.apply(SandboxModalEvent::Executed {
+            command: "echo hi".into(),
+            result: Ok(("hi".into(), false)),
+        });
+        modal.apply(SandboxModalEvent::Executed {
+            command: "false".into(),
+            result: Ok((String::new(), true)),
+        });
+        let shell = modal.shell.as_ref().unwrap();
+        assert_eq!(shell.entries.len(), 2);
+        assert!(shell.entries[1].is_error);
+        assert!(shell.error.is_none());
+    }
+
+    #[test]
+    fn failed_event_surfaces_spawn_error() {
+        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        modal.toggle();
+        modal.pending = Some(PendingJob::Shell);
+        modal.apply(SandboxModalEvent::Failed("spawn failed".into()));
+        assert_eq!(modal.spawn_error.as_deref(), Some("spawn failed"));
+        assert_eq!(modal.pending, None);
     }
 }

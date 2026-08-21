@@ -171,6 +171,7 @@ impl ParentIo {
     fn run(&mut self) {
         loop {
             if !self.drain_inbound() {
+                self.fail_all("sandbox ipc socket write failed");
                 return;
             }
 
@@ -181,6 +182,7 @@ impl ParentIo {
                     Ok(_) => pollfds[0].revents().unwrap_or(PollFlags::empty()),
                     Err(e) => {
                         error!("sandbox-parent-io: poll error: {e}");
+                        self.fail_all(&format!("sandbox ipc poll failed: {e}"));
                         return;
                     }
                 }
@@ -284,36 +286,40 @@ impl ParentIo {
                     stdout,
                     error: error.clone(),
                 });
-                if self.deliver(call_id, Ok(response)) {
-                    true
-                } else if call_id == NO_CALL_ID {
+                if call_id == NO_CALL_ID {
                     // Orphan Done without a call id means the child died during
                     // setup; no further IPC is possible.
                     warn!(error = ?error, "sandbox parent io: child failed fatally");
                     self.fail_all(&error.unwrap_or_else(|| "sandbox child exited".into()));
-                    false
-                } else {
-                    // Stale response to a call that already timed out; the
-                    // child keeps serving other requests.
-                    debug!(call_id, "sandbox parent io: stale Done for timed-out call");
-                    true
+                    return false;
                 }
+                self.deliver(call_id, Ok(response));
+                true
             }
             ChildMsg::ToolResult { call_id, result } => {
-                self.deliver(call_id, Ok(SandboxResponse::Tool(result)))
+                self.deliver(call_id, Ok(SandboxResponse::Tool(result)));
+                true
             }
             ChildMsg::LsResult { call_id, entries } => {
-                self.deliver(call_id, Ok(SandboxResponse::Ls(entries)))
+                self.deliver(call_id, Ok(SandboxResponse::Ls(entries)));
+                true
             }
             ChildMsg::PwdResult { call_id, path } => {
-                self.deliver(call_id, Ok(SandboxResponse::Pwd(path)))
+                self.deliver(call_id, Ok(SandboxResponse::Pwd(path)));
+                true
             }
-            ChildMsg::CdResult { call_id } => self.deliver(call_id, Ok(SandboxResponse::Cd)),
+            ChildMsg::CdResult { call_id } => {
+                self.deliver(call_id, Ok(SandboxResponse::Cd));
+                true
+            }
             ChildMsg::ExecResult {
                 call_id,
                 output,
                 is_error,
-            } => self.deliver(call_id, Ok(SandboxResponse::Exec((output, is_error)))),
+            } => {
+                self.deliver(call_id, Ok(SandboxResponse::Exec((output, is_error))));
+                true
+            }
         }
     }
 
@@ -327,25 +333,19 @@ impl ParentIo {
         }
     }
 
-    /// Wake the waiter registered for `call_id`, if any.
-    fn deliver(&self, call_id: u32, response: Result<SandboxResponse, String>) -> bool {
+    /// Wake the waiter registered for `call_id`, if any. Stale responses to
+    /// calls that already timed out are dropped without disturbing the loop.
+    fn deliver(&self, call_id: u32, response: Result<SandboxResponse, String>) {
         match self.pending.lock() {
-            Ok(mut pending) => {
-                if let Some(tx) = pending.remove(&call_id) {
+            Ok(mut pending) => match pending.remove(&call_id) {
+                Some(tx) => {
                     if tx.send(response).is_err() {
                         debug!(call_id, "sandbox parent io: waiter gone");
-                        return false;
                     }
-                    true
-                } else {
-                    debug!(call_id, "sandbox parent io: no pending waiter");
-                    false
                 }
-            }
-            Err(e) => {
-                warn!("sandbox parent io: pending mutex poisoned: {e}");
-                false
-            }
+                None => debug!(call_id, "sandbox parent io: no pending waiter"),
+            },
+            Err(e) => warn!("sandbox parent io: pending mutex poisoned: {e}"),
         }
     }
 

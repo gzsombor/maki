@@ -604,7 +604,11 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
         .map_err(|e| SandboxError::Mount(format!("cd to {staging}: {e}")))?;
     pivot_root(staging, &old_root)?;
 
-    let _ = umount2("/.old_root", MntFlags::MNT_DETACH);
+    if let Err(e) = umount2("/.old_root", MntFlags::MNT_DETACH) {
+        // The host root stays visible inside the sandbox, so isolation is
+        // incomplete; never silent.
+        warn!("sandbox: failed to detach /.old_root: {e}");
+    }
     let _ = std::fs::remove_dir("/.old_root");
 
     std::env::set_current_dir(format!("/home/maki/workspace/{}", config.workspace_name))

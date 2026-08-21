@@ -132,16 +132,27 @@ fn split_input(input: &Value) -> (Vec<Value>, Vec<(String, Value)>) {
     }
 }
 
-async fn sandbox_routed_reply(lua: &Lua, tool: &str, input: &Value) -> Option<ToolCallReply> {
+async fn sandbox_routed_reply(
+    lua: &Lua,
+    tool: &str,
+    input: &Value,
+    cancel: &CancelToken,
+) -> Option<ToolCallReply> {
     let router = lua
         .app_data_ref::<Arc<SandboxRouter>>()
         .map(|r| Arc::clone(&r))?;
     let (args, kwargs) = split_input(input);
     let tool = tool.to_string();
-    let result = smol::unblock(move || router(&tool, args, kwargs)).await;
+    // Dropping the unblock future on cancel detaches the blocking call: the
+    // child keeps running to completion, but the reply reports cancellation
+    // instead of waiting for it.
+    let result = cancel
+        .race(smol::unblock(move || router(&tool, args, kwargs)))
+        .await;
     Some(match result {
-        Ok(output) => ToolCallReply::plain(Ok(output)),
-        Err(e) => ToolCallReply::err(e),
+        Ok(Ok(output)) => ToolCallReply::plain(Ok(output)),
+        Ok(Err(e)) => ToolCallReply::err(e),
+        Err(message) => ToolCallReply::err(message),
     })
 }
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
@@ -2448,8 +2459,11 @@ async fn run_tool_call(
     plugins: PluginMap,
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
+    if shutdown.load(Ordering::Acquire) {
+        return ToolCallReply::err("plugin host shutting down");
+    }
     if SANDBOX_ROUTED_TOOLS.contains(&tool.as_ref()) && ctx.sandbox_enabled() {
-        if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input).await {
+        if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input, &ctx.cancel).await {
             return reply;
         }
         tracing::warn!(%tool, "sandbox routing failed; running tool on host");
@@ -2467,9 +2481,6 @@ async fn run_tool_call(
             Err(e) => return ToolCallReply::err(strip_traceback(&e)),
         }
     };
-    if shutdown.load(Ordering::Acquire) {
-        return ToolCallReply::err("plugin host shutting down");
-    }
 
     let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
     ctx.finish_tx = Some(finish_tx);

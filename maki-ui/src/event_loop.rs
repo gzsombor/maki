@@ -42,6 +42,8 @@ use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
+#[cfg(all(feature = "sandbox", target_os = "linux"))]
+use crate::components::sandbox_modal::SandboxModalEvent;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
@@ -262,6 +264,10 @@ struct SessionRuntime {
     handles: AgentHandles,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox_tx: flume::Sender<SandboxModalEvent>,
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    sandbox_rx: flume::Receiver<SandboxModalEvent>,
     last_status: SessionStatus,
     notifications: RunNotificationState,
 }
@@ -354,11 +360,17 @@ impl SpawnCtx {
             app.restore_resumed_session();
         }
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        let (sandbox_tx, sandbox_rx) = flume::unbounded::<SandboxModalEvent>();
         SessionRuntime {
             app,
             handles,
             shell_tx,
             shell_rx,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_tx,
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            sandbox_rx,
             last_status: SessionStatus::Idle,
             notifications: RunNotificationState::default(),
         }
@@ -388,6 +400,8 @@ enum Wake {
     Ui(UiAction),
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
+    #[cfg(all(feature = "sandbox", target_os = "linux"))]
+    Sandbox(usize, SandboxModalEvent),
     Warn(String),
 }
 
@@ -560,6 +574,8 @@ impl<'t> EventLoop<'t> {
             return Err(eyre!("event loop needs at least one session"));
         }
         let focused = focused.min(runtimes.len() - 1);
+        #[cfg(all(feature = "sandbox", target_os = "linux"))]
+        let sandbox_tx = runtimes[focused].sandbox_tx.clone();
         let app = &mut runtimes[focused].app;
         app.exit_on_done = exit_on_done;
         if needs_login {
@@ -573,8 +589,11 @@ impl<'t> EventLoop<'t> {
         // Initialize sandbox info from agent config.
         #[cfg(all(feature = "sandbox", target_os = "linux"))]
         {
-            app.sandbox_modal =
-                crate::components::sandbox_modal::SandboxModal::from_config(&ctx.config, sandbox);
+            app.sandbox_modal = crate::components::sandbox_modal::SandboxModal::from_config(
+                &ctx.config,
+                sandbox,
+                sandbox_tx,
+            );
         }
 
         for w in startup_warnings {
@@ -686,6 +705,12 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&rt.shell_rx, move |res| {
                 res.ok().map(|ev| Wake::Shell(i, ev))
             });
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            {
+                sel = sel.recv(&rt.sandbox_rx, move |res| {
+                    res.ok().map(|ev| Wake::Sandbox(i, ev))
+                });
+            }
         }
         sel.wait_timeout(timeout).ok().flatten()
     }
@@ -697,6 +722,8 @@ impl<'t> EventLoop<'t> {
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
+            #[cfg(all(feature = "sandbox", target_os = "linux"))]
+            Wake::Sandbox(i, event) => self.sessions[i].app.sandbox_modal.apply(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
         }
         Ok(())

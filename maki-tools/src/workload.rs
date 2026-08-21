@@ -139,7 +139,8 @@ fn build_bash_tool(ctx: &ChildCtx) -> ToolFn {
                         .and_then(|v| v.as_str())
                 });
             match ctx.exec(&command, workdir) {
-                Ok((output, _is_error)) => Ok(Value::String(output)),
+                Ok((output, true)) => Err(output),
+                Ok((output, false)) => Ok(Value::String(output)),
                 Err(e) => Err(format!("bash failed: {e}")),
             }
         },

@@ -7,6 +7,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, mpsc};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -14,6 +15,10 @@ use crate::ChildIoResult;
 use crate::child::{IoCommand, RemoteDispatch, sandbox_exec};
 use crate::error::SandboxError;
 use crate::ipc::ChildMsg;
+
+/// Backstop for a trusted-tool reply that never arrives (dead IO thread,
+/// lost message). Matches the parent-side run timeout.
+const FORWARD_TIMEOUT: Duration = Duration::from_mins(5);
 
 static CHILD_WORKLOAD: OnceLock<Arc<dyn ChildWorkload>> = OnceLock::new();
 
@@ -89,23 +94,19 @@ impl ChildCtx {
                 return Err("io thread disconnected".into());
             }
         }
-        let mut pending = dispatch.lock_pending().map_err(|e| e.to_string())?;
-        match rx.recv() {
-            Ok(Ok(payload)) => {
-                let _ = pending.remove(&call_id);
-                match payload.error {
-                    Some(error) => Err(error),
-                    None => Ok(payload.output.unwrap_or_default()),
-                }
-            }
-            Ok(Err(err)) => {
-                let _ = pending.remove(&call_id);
-                Err(err)
-            }
-            Err(_) => {
-                let _ = pending.remove(&call_id);
-                Err("io thread disconnected".into())
-            }
+        // Nothing may hold the pending lock across the wait: the reply is
+        // routed by the IO thread, which needs this map to deliver it.
+        let reply = rx.recv_timeout(FORWARD_TIMEOUT);
+        if let Ok(mut pending) = dispatch.lock_pending() {
+            pending.remove(&call_id);
+        }
+        match reply {
+            Ok(Ok(payload)) => match payload.error {
+                Some(error) => Err(error),
+                None => Ok(payload.output.unwrap_or_default()),
+            },
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err("trusted tool forward timed out or io thread stopped".into()),
         }
     }
 

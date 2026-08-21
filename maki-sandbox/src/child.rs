@@ -370,7 +370,7 @@ impl IoHandler {
     ) {
         loop {
             if !Self::drain_outgoing(&outgoing_rx, &mut sock) {
-                return;
+                break;
             }
 
             let ready = {
@@ -380,7 +380,7 @@ impl IoHandler {
                     Ok(_) => pollfds[0].revents().unwrap_or(PollFlags::empty()),
                     Err(e) => {
                         error!("sandbox-io: poll error: {e}");
-                        return;
+                        break;
                     }
                 }
             };
@@ -392,13 +392,16 @@ impl IoHandler {
                 Ok(msg) => msg,
                 Err(e) => {
                     error!("sandbox-io: recv error: {e}");
-                    return;
+                    break;
                 }
             };
             if !Self::handle_parent_msg(&mut sock, msg, &dispatch, &work_tx) {
-                return;
+                break;
             }
         }
+        // Whatever ended the loop, forwarded-trusted callers must not wait
+        // forever for replies that can no longer arrive.
+        Self::cancel_pending(&dispatch);
     }
 
     fn drain_outgoing(outgoing_rx: &Receiver<IoCommand>, sock: &mut UnixStream) -> bool {

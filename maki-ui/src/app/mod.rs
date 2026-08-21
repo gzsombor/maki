@@ -330,6 +330,7 @@ impl App {
                 crate::components::sandbox_modal::SandboxInfo {
                     enabled: false,
                     env_entries: vec![],
+                    allowed_env: vec![],
                     workspace_dir: String::new(),
                     workspace_name: String::new(),
                     home_mounts: vec![],
