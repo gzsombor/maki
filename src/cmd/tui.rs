@@ -200,10 +200,9 @@ fn build_stack(
                         .await
                 })
             });
-        plugin_host.set_sandbox_config(runner).ok().map(|_| {
-            plugin_host.set_sandbox_router(Arc::clone(&sandbox)).ok();
-            sandbox
-        })
+        plugin_host.set_sandbox_config(runner)?;
+        plugin_host.set_sandbox_router(Arc::clone(&sandbox))?;
+        Some(sandbox)
     } else {
         None
     };

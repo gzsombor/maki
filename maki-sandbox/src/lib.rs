@@ -222,7 +222,7 @@ impl ParentIo {
                 }
                 Err(e) => {
                     warn!("sandbox parent io: recv error: {e}");
-                    self.fail_all(format!("child closed the IPC socket: {e}"));
+                    self.fail_all(&format!("child closed the IPC socket: {e}"));
                     return;
                 }
             }
@@ -244,7 +244,7 @@ impl ParentIo {
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => {
                     debug!("sandbox parent io: inbound queue closed, shutting down");
-                    self.fail_all(SHUTDOWN_MSG.into());
+                    self.fail_all(SHUTDOWN_MSG);
                     return false;
                 }
             }
@@ -312,7 +312,7 @@ impl ParentIo {
                     // Orphan Done without a call id means the child died during
                     // setup; no further IPC is possible.
                     warn!(error = ?error, "sandbox parent io: child failed fatally");
-                    self.fail_all(error.unwrap_or_else(|| "sandbox child exited".into()));
+                    self.fail_all(&error.unwrap_or_else(|| "sandbox child exited".into()));
                     false
                 } else {
                     // Stale response to a call that already timed out; the
@@ -371,11 +371,11 @@ impl ParentIo {
         }
     }
 
-    fn fail_all(&self, message: String) {
+    fn fail_all(&self, message: &str) {
         if let Ok(mut pending) = self.pending.lock() {
             for (call_id, tx) in pending.drain() {
                 debug!(call_id, "sandbox parent io: failing pending waiter");
-                let _ = tx.send(Err(message.clone()));
+                let _ = tx.send(Err(message.to_string()));
             }
         }
     }

@@ -132,7 +132,7 @@ fn compute_env_entries(
     for (key, val) in env_vars {
         if seen.contains(key.as_str()) {
             if let Some(entry) = entries.iter_mut().find(|e| e.key == *key) {
-                entry.value = val.clone();
+                entry.value.clone_from(val);
             }
             continue;
         }
@@ -714,9 +714,9 @@ fn diagnose_mount_ns_blocked() -> String {
         if let Some(active) = active
             && (active == "integrity" || active == "confidentiality")
         {
-            msg.push_str(&format!(
-                "  - kernel lockdown={active} (usually enabled by Secure Boot)\n"
-            ));
+            msg.push_str("  - kernel lockdown=");
+            msg.push_str(active);
+            msg.push_str(" (usually enabled by Secure Boot)\n");
             any_clue = true;
         }
     }

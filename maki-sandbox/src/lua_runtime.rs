@@ -1042,7 +1042,6 @@ fn json_decode(lua: &Lua, text: String) -> LuaResult<LuaValue> {
 
 fn lua_to_json_inner(value: LuaValue) -> LuaResult<Value> {
     Ok(match value {
-        LuaValue::Nil => Value::Null,
         LuaValue::Boolean(b) => Value::Bool(b),
         LuaValue::Integer(i) => json!(i),
         LuaValue::Number(f) => json!(f),
