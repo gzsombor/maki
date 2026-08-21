@@ -491,6 +491,7 @@ pub struct AgentFileConfig {
     pub sandbox_allowed_env: Option<Vec<String>>,
     pub sandbox_allowed_paths: Option<Vec<String>>,
     pub sandbox_extra_dirs: Option<Vec<String>>,
+    pub sandbox_profiles: Option<Vec<String>>,
 }
 
 impl AgentFileConfig {
@@ -508,7 +509,8 @@ impl AgentFileConfig {
             sandbox_enabled,
             sandbox_allowed_env,
             sandbox_allowed_paths,
-            sandbox_extra_dirs
+            sandbox_extra_dirs,
+            sandbox_profiles
         );
     }
 }
@@ -1086,6 +1088,15 @@ pub struct AgentConfig {
     #[config(skip, default = "Vec::new()")]
     pub sandbox_extra_dirs: Vec<String>,
 
+    /// Enabled sandbox profiles (e.g. ["rust", "go"]). Only listed built-in
+    /// profiles contribute mounts and PATH entries.
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        desc = "Enabled sandbox profiles; only listed profiles contribute mounts and PATH entries"
+    )]
+    pub sandbox_profiles: Vec<String>,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -1116,6 +1127,7 @@ impl AgentConfig {
             sandbox_allowed_env: file.sandbox_allowed_env.unwrap_or_default(),
             sandbox_allowed_paths: file.sandbox_allowed_paths.unwrap_or_default(),
             sandbox_extra_dirs: file.sandbox_extra_dirs.unwrap_or_default(),
+            sandbox_profiles: file.sandbox_profiles.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -2027,6 +2039,37 @@ pub fn save_sandbox_enabled(cwd: &Path, enabled: bool) -> Result<(), String> {
         .as_table_mut()
         .ok_or_else(|| "agent section is not a table".to_string())?;
     agent_table.insert("sandbox_enabled", toml_edit::value(enabled));
+
+    std::fs::create_dir_all(&maki_dir).map_err(|e| format!("cannot create .maki dir: {e}"))?;
+    maki_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write .maki/config.toml: {e}"))?;
+    Ok(())
+}
+
+/// Persist the enabled sandbox profiles under `agent.sandbox_profiles`.
+pub fn save_sandbox_profiles(cwd: &Path, names: &[String]) -> Result<(), String> {
+    let maki_dir = cwd.join(PROJECT_DIR);
+    let path = maki_dir.join("config.toml");
+    let content = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("cannot read .maki/config.toml: {e}"))?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse .maki/config.toml: {e}"))?;
+
+    let agent = doc
+        .entry("agent")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let agent_table = agent
+        .as_table_mut()
+        .ok_or_else(|| "agent section is not a table".to_string())?;
+    let mut profiles = toml_edit::Array::new();
+    for name in names {
+        profiles.push(name.as_str());
+    }
+    agent_table.insert("sandbox_profiles", toml_edit::value(profiles));
 
     std::fs::create_dir_all(&maki_dir).map_err(|e| format!("cannot create .maki dir: {e}"))?;
     maki_storage::atomic_write(&path, doc.to_string().as_bytes())

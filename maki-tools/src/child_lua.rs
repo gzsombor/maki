@@ -54,6 +54,18 @@ impl ChildLuaRuntime {
             .map_err(|e| e.to_string())
     }
 
+    /// Execute a user `init.lua` after the embedded plugins have loaded, so
+    /// custom tools register through the same `maki.api.register_tool` path.
+    pub fn run_init_file(&self, path: &Path) -> Result<(), String> {
+        let src =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        self.lua
+            .load(&src)
+            .set_name(path.to_string_lossy().to_string())
+            .exec()
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Call a registered tool by name.
     pub fn call_tool(
         &self,
@@ -1338,5 +1350,43 @@ mod embedded_plugins {
         let (out, err) = rt.call_tool("opts_probe", &[], &[]).unwrap();
         assert!(!err, "{out}");
         assert_eq!(out, "42|nil");
+    }
+
+    #[test]
+    fn run_init_file_registers_custom_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("init.lua"),
+            r#"
+            maki.api.register_tool({
+                name = "custom_probe",
+                description = "probe user init.lua",
+                schema = { type = "object", properties = {} },
+                handler = function(_input, _ctx)
+                    return "ran-custom"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let rt = ChildLuaRuntime::new(Path::new(MISSING_PLUGIN_DIR)).unwrap();
+        rt.run_init_file(&dir.path().join("init.lua")).unwrap();
+        assert!(
+            rt.registered_tool_names()
+                .unwrap()
+                .iter()
+                .any(|n| n == "custom_probe")
+        );
+        let (out, err) = rt.call_tool("custom_probe", &[], &[]).unwrap();
+        assert!(!err, "{out}");
+        assert_eq!(out, "ran-custom");
+    }
+
+    #[test]
+    fn run_init_file_missing_file_is_ok() {
+        let rt = ChildLuaRuntime::new(Path::new(MISSING_PLUGIN_DIR)).unwrap();
+        let missing = tempfile::TempDir::new().unwrap().path().join("init.lua");
+        assert!(rt.run_init_file(&missing).is_err());
     }
 }

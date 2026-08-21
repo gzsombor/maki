@@ -289,6 +289,8 @@ pub struct SandboxModal {
     spawn_error: Option<String>,
     /// Set when the user toggles `enabled` via the UI.
     enabled_changed: bool,
+    /// Set when the user toggles any profile via the UI.
+    profiles_changed: bool,
     /// YOLO state as shown in the checkbox (owned by the app's permissions,
     /// mirrored here for display).
     yolo: bool,
@@ -314,6 +316,7 @@ impl SandboxModal {
             info_focus,
             spawn_error: None,
             enabled_changed: false,
+            profiles_changed: false,
             yolo: false,
             yolo_changed: false,
         }
@@ -333,13 +336,16 @@ impl SandboxModal {
             .as_ref()
             .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
             .unwrap_or_default();
-        let ns_config = NamespaceConfig::from_agent_config(
+        let enabled_profiles = profiles::select_profiles(&config.sandbox_profiles);
+        let mut ns_config = NamespaceConfig::from_agent_config(
             config.sandbox_allowed_env.clone(),
             &config.sandbox_allowed_paths,
             &config.sandbox_extra_dirs,
+            &enabled_profiles,
             workspace_dir.clone().unwrap_or_default(),
             workspace_name.clone(),
         );
+        ns_config.prune_missing_mounts();
         let home_mounts: Vec<(String, String)> = ns_config
             .home_mounts
             .iter()
@@ -364,12 +370,18 @@ impl SandboxModal {
                 home_mounts,
                 profiles: profiles::builtin_profiles()
                     .into_iter()
-                    .map(|p| (p, false))
+                    .map(|p| {
+                        let enabled = config.sandbox_profiles.contains(&p.name);
+                        (p, enabled)
+                    })
                     .collect(),
                 extra_workspace_dirs,
             },
             sandbox,
         );
+        // Enabled profile toggles contribute PATH entries on top of the
+        // base allow list.
+        modal.rebuild_env_entries();
         modal.event_tx = Some(event_tx);
         modal
     }
@@ -391,6 +403,7 @@ impl SandboxModal {
             self.pending = None;
             self.spawn_error = None;
             self.enabled_changed = false;
+            self.profiles_changed = false;
             self.yolo_changed = false;
             self.info_focus = Self::first_focus(&self.info);
         } else {
@@ -404,6 +417,22 @@ impl SandboxModal {
     /// The caller should check this after `handle_key` to persist the setting.
     pub fn take_enabled_changed(&mut self) -> bool {
         std::mem::take(&mut self.enabled_changed)
+    }
+
+    /// Returns and resets the `profiles_changed` flag.
+    /// The caller should check this after `handle_key` to persist the setting.
+    pub fn take_profiles_changed(&mut self) -> bool {
+        std::mem::take(&mut self.profiles_changed)
+    }
+
+    /// Names of the currently enabled profiles (config order = built-in order).
+    pub fn enabled_profile_names(&self) -> Vec<String> {
+        self.info
+            .profiles
+            .iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(p, _)| p.name.clone())
+            .collect()
     }
 
     /// Whether the sandbox is currently enabled.
@@ -480,6 +509,7 @@ impl SandboxModal {
             InfoFocus::Profile(i) => {
                 if let Some((_, enabled)) = self.info.profiles.get_mut(i) {
                     *enabled = !*enabled;
+                    self.profiles_changed = true;
                     self.rebuild_env_entries();
                 }
             }
@@ -623,7 +653,7 @@ impl SandboxModal {
             self.spawn_error = Some("sandbox not available".into());
             return;
         };
-        let config = self.build_namespace_config();
+        let config = self.build_spawn_config();
         self.pending = Some(job);
         smol::unblock(move || {
             if let Err(e) = sandbox.reinit(config) {
@@ -765,6 +795,15 @@ impl SandboxModal {
             extra_home_mounts,
             extra_workspace_dirs,
         )
+    }
+
+    /// Config for a real child spawn: like [`Self::build_namespace_config`],
+    /// but drops mount sources missing on this machine so an enabled profile
+    /// with absent directories cannot fail the spawn.
+    fn build_spawn_config(&self) -> NamespaceConfig {
+        let mut config = self.build_namespace_config();
+        config.prune_missing_mounts();
+        config
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {

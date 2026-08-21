@@ -87,7 +87,7 @@ A minimal `maki.*` API surface so the existing tool plugins load and execute ins
 - `maki.treesitter.*` -- stubs
 - `maki.async.run` -- runs inline (no async in the child)
 
-Plugins are embedded in the binary at compile time via `include_dir!("$CARGO_MANIFEST_DIR/../plugins")`, so no filesystem mount is needed for them. If the expected plugin directory exists (`/home/maki/.maki/plugins`, i.e. `~/.maki/plugins` allowed under `sandbox_allowed_paths`), it takes precedence -- useful for development. `require()` resolves modules from the directory's `lib/` subdirectory or from the embedded sources.
+Plugins are embedded in the binary at compile time via `include_dir!("$CARGO_MANIFEST_DIR/../plugins")`, so no filesystem mount is needed for them. User plugins load from the sandbox-visible config directory: the child probes `/home/maki/.config/maki` (XDG layout, mounted read-only by the `plugins` profile) and then `/home/maki/.maki/plugins` (legacy layout). The first existing `plugins/` subdir provides the plugin set; otherwise the embedded copies are used. An `init.lua` found in either config dir runs after the embedded plugins load, so custom tools register through the same `maki.api.register_tool` path. `require()` resolves modules from the chosen plugin directory's `lib/` subdirectory or from the embedded sources.
 
 ### Tool context (`ctx`)
 

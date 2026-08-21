@@ -182,13 +182,18 @@ fn build_stack(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let ns_config = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
-            config.agent.sandbox_allowed_env.clone(),
-            &config.agent.sandbox_allowed_paths,
-            &config.agent.sandbox_extra_dirs,
-            cwd,
-            workspace_name,
-        );
+        let ns_config = {
+            let mut cfg = maki_sandbox::namespace::NamespaceConfig::from_agent_config(
+                config.agent.sandbox_allowed_env.clone(),
+                &config.agent.sandbox_allowed_paths,
+                &config.agent.sandbox_extra_dirs,
+                &maki_sandbox::profiles::select_profiles(&config.agent.sandbox_profiles),
+                cwd,
+                workspace_name,
+            );
+            cfg.prune_missing_mounts();
+            cfg
+        };
         let sandbox = maki_sandbox::Sandbox::new(ns_config).context("initialize sandbox")?;
         let sandbox_for_runner = Arc::clone(&sandbox);
         let config_json = serde_json::to_string(&config.agent)?;

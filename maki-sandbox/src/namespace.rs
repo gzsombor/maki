@@ -12,7 +12,6 @@ use tracing::{debug, warn};
 
 use crate::error::SandboxError;
 use crate::ipc::{self, SYNC_GO, SYNC_READY};
-use crate::profiles;
 
 pub const DEFAULT_ALLOWED_ENV: &[&str] = &["LANG", "TERM", "TMPDIR", "RUST_LOG"];
 
@@ -251,14 +250,15 @@ impl NamespaceConfig {
     /// Build a `NamespaceConfig` from agent config fields.
     ///
     /// Shared logic used by both the TUI startup and the UI event loop to
-    /// construct sandbox configuration from the agent config. Built-in
-    /// profiles whose anchor directory exists (e.g. `~/.cargo` for rust) are
-    /// enabled automatically, so their mounts and PATH entries apply at
-    /// startup without manual setup.
+    /// construct sandbox configuration from the agent config. Only the
+    /// profiles passed in `enabled_profiles` contribute mounts and PATH
+    /// entries; use [`profiles::select_profiles`](crate::profiles::select_profiles)
+    /// to resolve configured names.
     pub fn from_agent_config(
         allowed_env: Vec<String>,
         allowed_paths: &[String],
         extra_dirs: &[String],
+        enabled_profiles: &[crate::profiles::SandboxProfile],
         workspace_dir: PathBuf,
         workspace_name: String,
     ) -> Self {
@@ -268,6 +268,7 @@ impl NamespaceConfig {
             allowed_env,
             allowed_paths,
             extra_dirs,
+            enabled_profiles,
             workspace_dir,
             workspace_name,
         )
@@ -278,6 +279,7 @@ impl NamespaceConfig {
         allowed_env: Vec<String>,
         allowed_paths: &[String],
         extra_dirs: &[String],
+        enabled_profiles: &[crate::profiles::SandboxProfile],
         workspace_dir: PathBuf,
         workspace_name: String,
     ) -> Self {
@@ -312,11 +314,7 @@ impl NamespaceConfig {
         let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
 
         if let Some(h) = home {
-            let auto_profiles: Vec<_> = profiles::builtin_profiles()
-                .into_iter()
-                .filter(|p| profiles::profile_anchor_under(p, h).is_some_and(|a| a.exists()))
-                .collect();
-            let flat = profiles::FlatMounts::from_profiles_under(&auto_profiles, h);
+            let flat = crate::profiles::FlatMounts::from_profiles_under(enabled_profiles, h);
             for (path, name) in flat.home {
                 if mounted_hosts.insert(path.clone()) {
                     home_mounts.push((path, name));
@@ -342,6 +340,26 @@ impl NamespaceConfig {
             extra_workspace_dirs,
             symlinks,
         )
+    }
+
+    /// Drop bind-mount entries whose host source does not exist.
+    ///
+    /// Opt-in profiles and user config may reference directories that are
+    /// absent on this machine; mounting them would fail the whole child
+    /// spawn. Missing sources are logged and skipped instead.
+    pub fn prune_missing_mounts(&mut self) {
+        fn retain_existing(mounts: &mut Vec<(PathBuf, String)>, kind: &str) {
+            mounts.retain(|(p, name)| {
+                let keep = p.exists();
+                if !keep {
+                    tracing::warn!(kind, host = %p.display(), target = %name, "sandbox: mount source missing, skipping");
+                }
+                keep
+            });
+        }
+        retain_existing(&mut self.home_mounts, "home_mount");
+        retain_existing(&mut self.readonly_mounts, "readonly_mount");
+        retain_existing(&mut self.extra_workspace_dirs, "extra_workspace_dir");
     }
 }
 
@@ -1128,6 +1146,7 @@ mod tests {
             vec!["MY_VAR".into()],
             &["/home/user/.local/maki".into()],
             &["/host/extras".into()],
+            &[],
             PathBuf::from("/workspace"),
             "myproject".into(),
         );
@@ -1146,6 +1165,7 @@ mod tests {
         let config = NamespaceConfig::from_agent_config_with(
             None,
             vec![],
+            &[],
             &[],
             &[],
             PathBuf::from("/ws"),
@@ -1168,6 +1188,7 @@ mod tests {
             vec![],
             &[allowed.to_string_lossy().into_owned()],
             &[],
+            &[],
             PathBuf::from("/ws"),
             "ws".into(),
         );
@@ -1180,22 +1201,25 @@ mod tests {
     }
 
     #[test]
-    fn from_agent_config_auto_enables_rust_profile() {
+    fn from_agent_config_applies_only_enabled_profiles() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".cargo/bin")).unwrap();
         std::fs::create_dir(tmp.path().join(".rustup")).unwrap();
+        std::fs::create_dir(tmp.path().join("go")).unwrap();
+        let rust_only: Vec<_> = crate::profiles::select_profiles(&["rust".into()]);
         let config = NamespaceConfig::from_agent_config_with(
             Some(tmp.path()),
             vec![],
             &[],
             &[],
+            &rust_only,
             PathBuf::from("/ws"),
             "ws".into(),
         );
         assert_eq!(
             config.path_dirs,
             vec!["/home/maki/.cargo/bin".to_string()],
-            "~/.cargo/bin must be on the sandbox PATH via the rust profile"
+            "enabled rust profile must extend the sandbox PATH"
         );
         assert!(
             config
@@ -1203,19 +1227,21 @@ mod tests {
                 .contains(&(tmp.path().join(".cargo"), ".cargo".into()))
         );
         assert!(
-            config
-                .readonly_mounts
-                .contains(&(tmp.path().join(".rustup"), ".rustup".into())),
-            "~/.rustup must be mounted read-only so rustup resolves toolchains"
+            !config
+                .home_mounts
+                .contains(&(tmp.path().join("go"), "go".into())),
+            "disabled go profile must not contribute mounts even though ~/go exists"
         );
     }
 
     #[test]
-    fn from_agent_config_skips_missing_profile_anchors() {
+    fn from_agent_config_without_profiles_mounts_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo/bin")).unwrap();
         let config = NamespaceConfig::from_agent_config_with(
             Some(tmp.path()),
             vec![],
+            &[],
             &[],
             &[],
             PathBuf::from("/ws"),
@@ -1224,5 +1250,30 @@ mod tests {
         assert!(config.home_mounts.is_empty());
         assert!(config.readonly_mounts.is_empty());
         assert!(config.path_dirs.is_empty());
+    }
+
+    #[test]
+    fn prune_missing_mounts_drops_absent_sources() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let present = tmp.path().join("present");
+        std::fs::create_dir(&present).unwrap();
+        let mut config = NamespaceConfig::new(
+            vec![],
+            vec![],
+            PathBuf::from("/ws"),
+            "ws".into(),
+            vec![
+                (present.clone(), "present".into()),
+                (tmp.path().join("absent"), "absent".into()),
+            ],
+            vec![(tmp.path().join("gone_ro"), "gone_ro".into())],
+            vec![],
+            vec![(tmp.path().join("nope"), "nope".into())],
+            vec![],
+        );
+        config.prune_missing_mounts();
+        assert_eq!(config.home_mounts, vec![(present, "present".into())]);
+        assert!(config.readonly_mounts.is_empty());
+        assert!(config.extra_workspace_dirs.is_empty());
     }
 }

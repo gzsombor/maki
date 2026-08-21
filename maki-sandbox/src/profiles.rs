@@ -131,7 +131,28 @@ pub fn builtin_profiles() -> Vec<SandboxProfile> {
                 ProfileMount::only_path("~/go/bin"),
             ],
         },
+        // Custom Maki plugins: the active config directory (XDG layout), or
+        // the legacy plugins subdir for `~/.maki` setups. Read-only: plugins
+        // are code to load, not data to mutate. Missing entries are pruned
+        // before spawn.
+        SandboxProfile {
+            name: "plugins".into(),
+            mounts: vec![
+                ProfileMount::read_only("~/.config/maki"),
+                ProfileMount::read_only("~/.maki/plugins"),
+            ],
+        },
     ]
+}
+
+/// The built-in profiles whose names appear in `names`, in built-in order.
+/// Unknown names are ignored.
+#[must_use]
+pub fn select_profiles(names: &[String]) -> Vec<SandboxProfile> {
+    builtin_profiles()
+        .into_iter()
+        .filter(|p| names.iter().any(|n| n == &p.name))
+        .collect()
 }
 
 /// Flattened profile mounts ready to merge into a [`NamespaceConfig`].
@@ -171,15 +192,6 @@ impl FlatMounts {
         }
         out
     }
-}
-
-/// The host directory a profile anchors on (its first mount). A built-in
-/// profile is auto-enabled at startup when this path exists on the host.
-pub(crate) fn profile_anchor_under(profile: &SandboxProfile, home: &Path) -> Option<PathBuf> {
-    profile
-        .mounts
-        .first()
-        .map(|m| m.resolved_host_path_under(home))
 }
 
 /// Build a [`NamespaceConfig`] from profiles.
@@ -277,7 +289,30 @@ mod tests {
     fn builtin_profiles_have_expected_names() {
         let profiles = builtin_profiles();
         let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["rust", "java", "node", "go"]);
+        assert_eq!(names, ["rust", "java", "node", "go", "plugins"]);
+    }
+
+    #[test]
+    fn select_profiles_keeps_builtin_order_and_ignores_unknown() {
+        let selected = select_profiles(&["go".into(), "nope".into(), "rust".into(), "rust".into()]);
+        let names: Vec<&str> = selected.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["rust", "go"],
+            "built-in order wins, unknowns and duplicates dropped"
+        );
+    }
+
+    #[test]
+    fn plugins_profile_mounts_config_dirs_read_only() {
+        let plugins = builtin_profiles()
+            .into_iter()
+            .find(|p| p.name == "plugins")
+            .unwrap();
+        assert_eq!(plugins.mounts[0].path, "~/.config/maki");
+        assert_eq!(plugins.mounts[0].usage, MountUsage::ReadOnly);
+        assert_eq!(plugins.mounts[1].path, "~/.maki/plugins");
+        assert_eq!(plugins.mounts[1].usage, MountUsage::ReadOnly);
     }
 
     #[test]

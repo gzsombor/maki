@@ -174,16 +174,19 @@ Trusted tools forwarded by the child are answered by the `handler` closure of th
 
 ## Profiles
 
-Profiles define collections of host directories to mount inside the sandbox. Built-in profiles:
+Profiles are named collections of host directories that can be toggled per project. Only enabled profiles contribute mounts and PATH entries; they are enabled in the Sandbox dialog or via `agent.sandbox_profiles = ["rust", "go"]` in `.maki/config.toml`, and that choice persists. Mount sources missing on the host are skipped with a warning instead of failing the spawn.
 
-| Name   | Mounts                                         |
-|--------|-------------------------------------------------|
-| `rust` | `~/.cargo` (rw), `~/.cargo/bin` (PATH), `~/.rustup` (ro) |
-| `java` | `~/.m2` (rw), `~/.gradle` (rw)                |
-| `node` | `~/.npm` (rw), `~/.yarn` (rw), `~/.npm/bin` (PATH) |
-| `go`   | `~/go` (rw), `~/go/bin` (PATH)                |
+Built-in profiles:
 
-Use `profiles::build_namespace_config()` to convert enabled profiles into a `NamespaceConfig`.
+| Name      | Mounts                                         |
+|-----------|-------------------------------------------------|
+| `rust`    | `~/.cargo` (rw), `~/.cargo/bin` (PATH), `~/.rustup` (ro) |
+| `java`    | `~/.m2` (rw), `~/.gradle` (rw)                |
+| `node`    | `~/.npm` (rw), `~/.yarn` (rw), `~/.npm/bin` (PATH) |
+| `go`      | `~/go` (rw), `~/go/bin` (PATH)                |
+| `plugins` | `~/.config/maki` (ro), `~/.maki/plugins` (ro) -- custom Maki plugins inside the sandbox |
+
+Use `profiles::select_profiles()` to resolve configured names against the built-ins, and `profiles::build_namespace_config()` to convert enabled profiles into a `NamespaceConfig`.
 
 ## Binaries
 

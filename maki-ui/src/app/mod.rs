@@ -743,6 +743,14 @@ impl App {
                         .flash(format!("failed to save sandbox setting: {e}"));
                 }
             }
+            if self.sandbox_modal.take_profiles_changed() {
+                let names = self.sandbox_modal.enabled_profile_names();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| "..".into());
+                if let Err(e) = maki_config::save_sandbox_profiles(&cwd, &names) {
+                    self.status_bar
+                        .flash(format!("failed to save sandbox profiles: {e}"));
+                }
+            }
             if self.sandbox_modal.take_yolo_changed() {
                 let enabled = self.permissions.toggle_yolo();
                 self.flash(if enabled {

@@ -5,7 +5,7 @@
 //! Lua plugins loaded from the sandboxed plugin dir, and trusted forwards.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use maki_interpreter::runner::{self, ToolFn};
@@ -33,6 +33,21 @@ const TRUSTED_TOOLS: &[&str] = &[
 /// inside the mount namespace, so their operations are naturally sandboxed.
 const CHILD_LOCAL_TOOLS: &[&str] = &["read", "write", "edit", "multiedit", "glob", "grep", "list"];
 
+/// Sandbox-side config dirs probed for user plugins, in precedence order.
+/// `~/.config/maki` is the XDG layout (mounted by the `plugins` profile);
+/// `~/.maki` is the legacy layout.
+const SANDBOX_CONFIG_DIRS: &[&str] = &["/home/maki/.config/maki", "/home/maki/.maki"];
+
+/// First existing `<config>/plugins` dir, or the XDG candidate when none
+/// exists (`ChildLuaRuntime` falls back to the embedded plugins then).
+fn discover_plugin_dir(candidates: &[&str]) -> PathBuf {
+    candidates
+        .iter()
+        .map(|d| Path::new(d).join("plugins"))
+        .find(|p| p.is_dir())
+        .unwrap_or_else(|| Path::new(candidates[0]).join("plugins"))
+}
+
 /// Register the default workload with `maki-sandbox`.
 ///
 /// Call once at process startup, before any child is spawned or re-execed.
@@ -46,14 +61,26 @@ struct MakiChildWorkload;
 
 impl ChildWorkload for MakiChildWorkload {
     fn init(&self, ctx: ChildCtx) -> Result<Box<dyn ChildSession>, String> {
-        let plugin_dir = Path::new("/home/maki/.maki/plugins");
-        let lua_runtime = match ChildLuaRuntime::new(plugin_dir) {
+        let plugin_dir = discover_plugin_dir(SANDBOX_CONFIG_DIRS);
+        let lua_runtime = match ChildLuaRuntime::new(&plugin_dir) {
             Ok(rt) => Some(Arc::new(rt)),
             Err(e) => {
                 warn!(error = %e, "sandbox child: lua runtime init failed, filesystem tools unavailable");
                 None
             }
         };
+
+        if let Some(ref rt) = lua_runtime {
+            let init = SANDBOX_CONFIG_DIRS
+                .iter()
+                .map(|d| Path::new(d).join("init.lua"))
+                .find(|p| p.is_file());
+            if let Some(init) = init
+                && let Err(e) = rt.run_init_file(&init)
+            {
+                warn!(error = %e, "sandbox child: user init.lua failed");
+            }
+        }
 
         let mut tools: HashMap<String, ToolFn> = HashMap::new();
         tools.insert("bash".into(), build_bash_tool(&ctx));
@@ -277,5 +304,24 @@ mod tests {
         let args = vec![json!("/positional")];
         let kwargs = vec![("path".into(), json!("/from_kwargs"))];
         assert_eq!(require_str(&args, &kwargs, "path").unwrap(), "/from_kwargs");
+    }
+
+    #[test]
+    fn discover_plugin_dir_prefers_first_existing_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(first.join("plugins")).unwrap();
+        std::fs::create_dir_all(second.join("plugins")).unwrap();
+        let got = discover_plugin_dir(&[first.to_str().unwrap(), second.to_str().unwrap()]);
+        assert_eq!(got, first.join("plugins"));
+    }
+
+    #[test]
+    fn discover_plugin_dir_falls_back_to_first_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("missing");
+        let got = discover_plugin_dir(&[missing.to_str().unwrap()]);
+        assert_eq!(got, missing.join("plugins"));
     }
 }
