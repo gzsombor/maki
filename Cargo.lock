@@ -2694,7 +2694,6 @@ dependencies = [
  "maki-lua-macro",
  "maki-markdown",
  "maki-providers",
- "maki-sandbox",
  "maki-storage",
  "mlua",
  "pin-project-lite",

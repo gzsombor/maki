@@ -23,6 +23,7 @@ use crate::setup;
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
+const EMPTY_TOOL_RESULT: &str = "empty tool result";
 
 /// One generation of the app: everything torn down and rebuilt on `/reload`.
 /// Dropping it joins the Lua thread via `PluginHost::drop`.
@@ -201,7 +202,16 @@ fn build_stack(
                 })
             });
         plugin_host.set_sandbox_config(runner)?;
-        plugin_host.set_sandbox_router(Arc::clone(&sandbox))?;
+        let sandbox_for_router = Arc::clone(&sandbox);
+        plugin_host.set_sandbox_router(Arc::new(
+            move |name, args, kwargs| match sandbox_for_router.call_tool(name, args, kwargs) {
+                Ok(r) => r
+                    .error
+                    .map(Err)
+                    .unwrap_or_else(|| r.output.ok_or_else(|| EMPTY_TOOL_RESULT.into())),
+                Err(e) => Err(e.to_string()),
+            },
+        ))?;
         Some(sandbox)
     } else {
         None

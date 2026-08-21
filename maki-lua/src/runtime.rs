@@ -101,6 +101,11 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// Executes a tool call outside the plugin host. The binary wires this to
+/// the sandbox child; an Err marks the tool result as an error.
+pub type SandboxRouter =
+    dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<String, String> + Send + Sync;
+
 /// Tools that execute inside the sandbox child instead of the host Lua
 /// plugins whenever sandbox mode is on.
 const SANDBOX_ROUTED_TOOLS: &[&str] = &[
@@ -127,21 +132,17 @@ fn split_input(input: &Value) -> (Vec<Value>, Vec<(String, Value)>) {
     }
 }
 
-#[cfg(feature = "sandbox")]
 async fn sandbox_routed_reply(lua: &Lua, tool: &str, input: &Value) -> Option<ToolCallReply> {
-    let tool = tool.to_string();
-    let input = input.clone();
     let router = lua
-        .app_data_ref::<Arc<maki_sandbox::Sandbox>>()
+        .app_data_ref::<Arc<SandboxRouter>>()
         .map(|r| Arc::clone(&r))?;
-    let (args, kwargs) = split_input(&input);
-    let result = smol::unblock(move || router.call_tool(&tool, args, kwargs)).await;
-    match result {
-        Ok(r) => Some(ToolCallReply::plain(r.error.map(Err).unwrap_or_else(
-            || r.output.ok_or_else(|| "empty tool result".to_string()),
-        ))),
-        Err(e) => Some(ToolCallReply::err(e.to_string())),
-    }
+    let (args, kwargs) = split_input(input);
+    let tool = tool.to_string();
+    let result = smol::unblock(move || router(&tool, args, kwargs)).await;
+    Some(match result {
+        Ok(output) => ToolCallReply::plain(Ok(output)),
+        Err(e) => ToolCallReply::err(e),
+    })
 }
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
@@ -256,8 +257,7 @@ pub enum Request {
         fallback: Option<Box<ClickFallback>>,
     },
     SetSandboxConfig(Arc<SandboxRunner>),
-    #[cfg(feature = "sandbox")]
-    SetSandboxRouter(Arc<maki_sandbox::Sandbox>),
+    SetSandboxRouter(Arc<SandboxRouter>),
     RunKeybindCallback {
         id: u64,
     },
@@ -2449,15 +2449,10 @@ async fn run_tool_call(
     shutdown: Arc<AtomicBool>,
 ) -> ToolCallReply {
     if SANDBOX_ROUTED_TOOLS.contains(&tool.as_ref()) && ctx.sandbox_enabled() {
-        #[cfg(feature = "sandbox")]
-        {
-            if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input).await {
-                return reply;
-            }
-            tracing::warn!(%tool, "sandbox routing failed; running tool on host");
+        if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input).await {
+            return reply;
         }
-        #[cfg(not(feature = "sandbox"))]
-        tracing::warn!(%tool, "sandbox routing requested but sandbox feature is disabled");
+        tracing::warn!(%tool, "sandbox routing failed; running tool on host");
     }
     let handler: Function = {
         let plugins_ref = plugins.borrow();
@@ -2944,9 +2939,8 @@ pub fn spawn(
                         Request::SetSandboxConfig(runner) => {
                             rt.lua.set_app_data(runner);
                         }
-                        #[cfg(feature = "sandbox")]
-                        Request::SetSandboxRouter(sandbox) => {
-                            rt.lua.set_app_data(sandbox);
+                        Request::SetSandboxRouter(router) => {
+                            rt.lua.set_app_data(router);
                         }
                         Request::RunKeybindCallback { id } => {
                             let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
@@ -4169,7 +4163,6 @@ mod tests {
         }));
     }
 
-    #[cfg(feature = "sandbox")]
     mod split_input_tests {
         use super::*;
         use serde_json::json;
