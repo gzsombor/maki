@@ -3,8 +3,10 @@ use std::process::Command;
 use std::sync::Arc;
 
 use include_dir::{Dir, include_dir};
+use maki_agent::tools::interpreter_bridge::build_tool_input;
 use maki_agent::tools::{FileReadTracker, grep as grep_tool};
 use maki_agent::{LoadedInstructions, find_subdirectory_instructions, is_instruction_file};
+use maki_lua::json_to_lua;
 use mlua::MultiValue;
 use mlua::prelude::*;
 use mlua::{UserData, UserDataMethods};
@@ -79,7 +81,7 @@ impl ChildLuaRuntime {
             .get(name)
             .map_err(|e| format!("tool '{name}' not found: {e}"))?;
 
-        let input = build_tool_input(args, kwargs);
+        let input = build_tool_input(args, kwargs).map_err(|e| format!("{name}: {e}"))?;
         let input_lua = json_to_lua(&self.lua, &input).map_err(|e| e.to_string())?;
         let ctx = build_ctx(&self.lua, &self.tracker, &self.instructions)
             .map_err(|e| format!("{name}: build ctx: {e}"))?;
@@ -470,49 +472,6 @@ fn load_plugins(lua: &Lua, plugin_dir: &Path) -> Result<(), LuaError> {
 // ──────────────────────────────────────────────
 //  Tool dispatch helpers
 // ──────────────────────────────────────────────
-
-fn build_tool_input(args: &[Value], kwargs: &[(String, Value)]) -> Value {
-    if let Some(first) = args.first()
-        && first.is_object()
-    {
-        return first.clone();
-    }
-    if !kwargs.is_empty() {
-        let mut obj = serde_json::Map::new();
-        for (k, v) in kwargs {
-            obj.insert(k.clone(), v.clone());
-        }
-        return Value::Object(obj);
-    }
-    json!({})
-}
-
-fn json_to_lua(lua: &Lua, value: &Value) -> LuaResult<LuaValue> {
-    Ok(match value {
-        Value::Null => LuaValue::Nil,
-        Value::Bool(b) => LuaValue::Boolean(*b),
-        Value::Number(n) => match (n.as_i64(), n.as_f64()) {
-            (Some(i), _) => LuaValue::Integer(i),
-            (_, Some(f)) => LuaValue::Number(f),
-            _ => LuaValue::Nil,
-        },
-        Value::String(s) => LuaValue::String(lua.create_string(s.as_bytes())?),
-        Value::Array(arr) => {
-            let t = lua.create_table()?;
-            for (i, v) in arr.iter().enumerate() {
-                t.set(i + 1, json_to_lua(lua, v)?)?;
-            }
-            LuaValue::Table(t)
-        }
-        Value::Object(map) => {
-            let t = lua.create_table()?;
-            for (k, v) in map {
-                t.set(k.as_str(), json_to_lua(lua, v)?)?;
-            }
-            LuaValue::Table(t)
-        }
-    })
-}
 
 /// Extract `(output, is_error)` from Lua handler return values.
 ///
