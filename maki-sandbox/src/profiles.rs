@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::namespace::NamespaceConfig;
 
@@ -55,10 +55,16 @@ impl ProfileMount {
 
     /// Resolve tilde path to an absolute host path.
     pub fn resolved_host_path(&self) -> PathBuf {
-        if let Some(rest) = self.path.strip_prefix("~/")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            return PathBuf::from(home).join(rest);
+        match std::env::var("HOME") {
+            Ok(home) => self.resolved_host_path_under(Path::new(&home)),
+            Err(_) => PathBuf::from(&self.path),
+        }
+    }
+
+    /// Resolve tilde path against an explicit home directory.
+    pub(crate) fn resolved_host_path_under(&self, home: &Path) -> PathBuf {
+        if let Some(rest) = self.path.strip_prefix("~/") {
+            return home.join(rest);
         }
         PathBuf::from(&self.path)
     }
@@ -120,6 +126,54 @@ pub fn builtin_profiles() -> Vec<SandboxProfile> {
     ]
 }
 
+/// Flattened profile mounts ready to merge into a [`NamespaceConfig`].
+pub(crate) struct FlatMounts {
+    pub home: Vec<(PathBuf, String)>,
+    pub readonly: Vec<(PathBuf, String)>,
+    pub path_dirs: Vec<String>,
+    pub symlinks: Vec<(PathBuf, String)>,
+}
+
+impl FlatMounts {
+    pub(crate) fn from_profiles(enabled: &[SandboxProfile]) -> Self {
+        match std::env::var("HOME") {
+            Ok(home) => Self::from_profiles_under(enabled, Path::new(&home)),
+            Err(_) => Self::from_profiles_under(enabled, Path::new("/")),
+        }
+    }
+
+    pub(crate) fn from_profiles_under(enabled: &[SandboxProfile], home: &Path) -> Self {
+        let mut out = Self {
+            home: Vec::new(),
+            readonly: Vec::new(),
+            path_dirs: Vec::new(),
+            symlinks: Vec::new(),
+        };
+        for profile in enabled {
+            for mount in &profile.mounts {
+                let path = mount.resolved_host_path_under(home);
+                let name = mount.dir_name();
+                match mount.usage {
+                    MountUsage::Write => out.home.push((path, name)),
+                    MountUsage::ReadOnly => out.readonly.push((path, name)),
+                    MountUsage::OnlyPath => out.path_dirs.push(mount.sandbox_internal_path()),
+                    MountUsage::SymLink => out.symlinks.push((path, name)),
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The host directory a profile anchors on (its first mount). A built-in
+/// profile is auto-enabled at startup when this path exists on the host.
+pub(crate) fn profile_anchor_under(profile: &SandboxProfile, home: &Path) -> Option<PathBuf> {
+    profile
+        .mounts
+        .first()
+        .map(|m| m.resolved_host_path_under(home))
+}
+
 /// Build a [`NamespaceConfig`] from profiles.
 ///
 /// Each profile contributes mounts and PATH entries. `extra_home_mounts`
@@ -131,34 +185,19 @@ pub fn build_namespace_config(
     extra_home_mounts: Vec<(PathBuf, String)>,
     extra_workspace_dirs: Vec<(PathBuf, String)>,
 ) -> NamespaceConfig {
+    let flat = FlatMounts::from_profiles(profiles);
     let mut home_mounts = extra_home_mounts;
-    let mut readonly_mounts: Vec<(PathBuf, String)> = Vec::new();
-    let mut path_dirs: Vec<String> = Vec::new();
-    let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
-
-    for profile in profiles {
-        for mount in &profile.mounts {
-            let path = mount.resolved_host_path();
-            let name = mount.dir_name();
-            match mount.usage {
-                MountUsage::Write => home_mounts.push((path, name)),
-                MountUsage::ReadOnly => readonly_mounts.push((path, name)),
-                MountUsage::OnlyPath => path_dirs.push(mount.sandbox_internal_path()),
-                MountUsage::SymLink => symlinks.push((path, name)),
-            }
-        }
-    }
-
+    home_mounts.extend(flat.home);
     NamespaceConfig::new(
         vec![],
         vec![],
         workspace_dir,
         workspace_name,
         home_mounts,
-        readonly_mounts,
-        path_dirs,
+        flat.readonly,
+        flat.path_dirs,
         extra_workspace_dirs,
-        symlinks,
+        flat.symlinks,
     )
 }
 

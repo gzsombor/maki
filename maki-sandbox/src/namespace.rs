@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 use crate::error::SandboxError;
 use crate::ipc::{self, SYNC_GO, SYNC_READY};
+use crate::profiles;
 
 pub const DEFAULT_ALLOWED_ENV: &[&str] = &["LANG", "TERM", "TMPDIR", "RUST_LOG"];
 
@@ -54,7 +55,7 @@ pub struct NamespaceConfig {
 }
 
 fn build_sandbox_path(path_dirs: &[String]) -> String {
-    let mut p = String::from("/usr/bin:/usr/local/bin");
+    let mut p = String::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin");
     if !path_dirs.is_empty() {
         p.push(':');
         p.push_str(&path_dirs.join(":"));
@@ -249,7 +250,10 @@ impl NamespaceConfig {
     /// Build a `NamespaceConfig` from agent config fields.
     ///
     /// Shared logic used by both the TUI startup and the UI event loop to
-    /// construct sandbox configuration from the agent config.
+    /// construct sandbox configuration from the agent config. Built-in
+    /// profiles whose anchor directory exists (e.g. `~/.cargo` for rust) are
+    /// enabled automatically, so their mounts and PATH entries apply at
+    /// startup without manual setup.
     pub fn from_agent_config(
         allowed_env: Vec<String>,
         allowed_paths: &[String],
@@ -258,11 +262,29 @@ impl NamespaceConfig {
         workspace_name: String,
     ) -> Self {
         let home = std::env::var("HOME").ok().map(PathBuf::from);
-        let home_mounts: Vec<(PathBuf, String)> = allowed_paths
+        Self::from_agent_config_with(
+            home.as_deref(),
+            allowed_env,
+            allowed_paths,
+            extra_dirs,
+            workspace_dir,
+            workspace_name,
+        )
+    }
+
+    fn from_agent_config_with(
+        home: Option<&Path>,
+        allowed_env: Vec<String>,
+        allowed_paths: &[String],
+        extra_dirs: &[String],
+        workspace_dir: PathBuf,
+        workspace_name: String,
+    ) -> Self {
+        let mut home_mounts: Vec<(PathBuf, String)> = allowed_paths
             .iter()
             .filter_map(|p| {
                 let path = PathBuf::from(p);
-                home.as_ref().and_then(|h| {
+                home.and_then(|h| {
                     path.strip_prefix(h).ok().map(|rel| {
                         let name = rel.to_string_lossy().to_string();
                         (path.clone(), name.trim_start_matches('/').to_string())
@@ -281,16 +303,43 @@ impl NamespaceConfig {
                 (path, name)
             })
             .collect();
+
+        let mut mounted_hosts: HashSet<PathBuf> =
+            home_mounts.iter().map(|(p, _)| p.clone()).collect();
+        let mut path_dirs: Vec<String> = Vec::new();
+        let mut readonly_mounts: Vec<(PathBuf, String)> = Vec::new();
+        let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
+
+        if let Some(h) = home {
+            let auto_profiles: Vec<_> = profiles::builtin_profiles()
+                .into_iter()
+                .filter(|p| profiles::profile_anchor_under(p, h).is_some_and(|a| a.exists()))
+                .collect();
+            let flat = profiles::FlatMounts::from_profiles_under(&auto_profiles, h);
+            for (path, name) in flat.home {
+                if mounted_hosts.insert(path.clone()) {
+                    home_mounts.push((path, name));
+                }
+            }
+            for (path, name) in flat.readonly {
+                if mounted_hosts.insert(path.clone()) {
+                    readonly_mounts.push((path, name));
+                }
+            }
+            path_dirs.extend(flat.path_dirs);
+            symlinks.extend(flat.symlinks);
+        }
+
         Self::new(
             allowed_env,
             vec![],
             workspace_dir,
             workspace_name,
             home_mounts,
-            vec![],
-            vec![],
+            readonly_mounts,
+            path_dirs,
             extra_workspace_dirs,
-            vec![],
+            symlinks,
         )
     }
 }
@@ -952,14 +1001,20 @@ mod tests {
 
     #[test]
     fn build_sandbox_path_empty_dirs() {
-        assert_eq!(build_sandbox_path(&[]), "/usr/bin:/usr/local/bin");
+        assert_eq!(
+            build_sandbox_path(&[]),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+        );
     }
 
     #[test]
     fn build_sandbox_path_with_dirs() {
         let dirs = vec!["/home/maki/.cargo/bin".into(), "/opt/bin".into()];
         let result = build_sandbox_path(&dirs);
-        assert!(result.starts_with("/usr/bin:/usr/local/bin:"));
+        assert!(
+            result.starts_with("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"),
+            "profile dirs must come after the defaults, got {result}"
+        );
         assert!(result.contains("/home/maki/.cargo/bin"));
         assert!(result.contains("/opt/bin"));
     }
@@ -1051,7 +1106,8 @@ mod tests {
 
     #[test]
     fn from_agent_config_basic() {
-        let config = NamespaceConfig::from_agent_config(
+        let config = NamespaceConfig::from_agent_config_with(
+            None,
             vec!["MY_VAR".into()],
             &["/home/user/.local/maki".into()],
             &["/host/extras".into()],
@@ -1070,10 +1126,84 @@ mod tests {
 
     #[test]
     fn from_agent_config_empty() {
-        let config =
-            NamespaceConfig::from_agent_config(vec![], &[], &[], PathBuf::from("/ws"), "ws".into());
+        let config = NamespaceConfig::from_agent_config_with(
+            None,
+            vec![],
+            &[],
+            &[],
+            PathBuf::from("/ws"),
+            "ws".into(),
+        );
         assert!(config.home_mounts.is_empty());
+        assert!(config.readonly_mounts.is_empty());
+        assert!(config.path_dirs.is_empty());
         assert!(config.extra_workspace_dirs.is_empty());
         assert!(config.allowed_env.is_empty());
+    }
+
+    #[test]
+    fn from_agent_config_dedupes_allowed_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo/bin")).unwrap();
+        let allowed = tmp.path().join(".cargo");
+        let config = NamespaceConfig::from_agent_config_with(
+            Some(tmp.path()),
+            vec![],
+            &[allowed.to_string_lossy().into_owned()],
+            &[],
+            PathBuf::from("/ws"),
+            "ws".into(),
+        );
+        let cargo_mounts = config
+            .home_mounts
+            .iter()
+            .filter(|(p, _)| p == &allowed)
+            .count();
+        assert_eq!(cargo_mounts, 1, "allowed path must not be mounted twice");
+    }
+
+    #[test]
+    fn from_agent_config_auto_enables_rust_profile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cargo/bin")).unwrap();
+        std::fs::create_dir(tmp.path().join(".rustup")).unwrap();
+        let config = NamespaceConfig::from_agent_config_with(
+            Some(tmp.path()),
+            vec![],
+            &[],
+            &[],
+            PathBuf::from("/ws"),
+            "ws".into(),
+        );
+        assert_eq!(
+            config.path_dirs,
+            vec!["/home/maki/.cargo/bin".to_string()],
+            "~/.cargo/bin must be on the sandbox PATH via the rust profile"
+        );
+        assert!(config
+            .home_mounts
+            .contains(&(tmp.path().join(".cargo"), ".cargo".into())));
+        assert!(
+            config
+                .readonly_mounts
+                .contains(&(tmp.path().join(".rustup"), ".rustup".into())),
+            "~/.rustup must be mounted read-only so rustup resolves toolchains"
+        );
+    }
+
+    #[test]
+    fn from_agent_config_skips_missing_profile_anchors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = NamespaceConfig::from_agent_config_with(
+            Some(tmp.path()),
+            vec![],
+            &[],
+            &[],
+            PathBuf::from("/ws"),
+            "ws".into(),
+        );
+        assert!(config.home_mounts.is_empty());
+        assert!(config.readonly_mounts.is_empty());
+        assert!(config.path_dirs.is_empty());
     }
 }
