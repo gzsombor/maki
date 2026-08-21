@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
@@ -160,7 +160,7 @@ pub async fn run(
         let elapsed = started.elapsed();
         match result.output {
             Ok(output) => {
-                info!(
+                debug!(
                     tool = %name,
                     source = %entry.source.as_log_field(),
                     elapsed_ms = elapsed.as_millis() as u64,
@@ -272,10 +272,7 @@ async fn run_local_tool(
         ..ctx.clone()
     };
     let (output, is_error) = match local(input.clone(), tool_ctx).await {
-        Ok(output) => {
-            info!(tool = %name, output = %output, "local tool succeeded");
-            (output, false)
-        }
+        Ok(output) => (output, false),
         Err(e) => {
             warn!(tool = %name, error = %e, "local tool failed");
             (e, true)
@@ -377,10 +374,7 @@ async fn execute_mcp_tool(
     // definition joins the next request; a denied call must not load anything.
     mcp.mark_loaded(tool_name);
     match mcp.call_tool(tool_name, input).await {
-        Ok(text) => {
-            info!(tool = %tool_name, "MCP tool ok");
-            done(text, false)
-        }
+        Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),
     }
 }
@@ -406,7 +400,7 @@ pub(super) async fn process_tool_calls(
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
     for (id, name, input) in tool_uses {
-        info!(
+        debug!(
             tool = %name,
             id = %id,
             input_preview = %crate::tools::schema::preview(&input.to_string()),
