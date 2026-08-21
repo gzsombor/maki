@@ -25,12 +25,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-maki-agent = { workspace = true }
-maki-interpreter = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
-mlua = { workspace = true }
-include_dir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

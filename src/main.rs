@@ -1,8 +1,6 @@
 mod cli;
 mod cmd;
 mod print;
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-mod sandbox;
 mod sdk_mode;
 mod setup;
 mod update;
@@ -15,8 +13,13 @@ fn main() {
     color_eyre::install().ok();
     let cli = Cli::parse();
     #[cfg(all(feature = "sandbox", target_os = "linux"))]
-    if cli.sandbox_inner {
-        maki_sandbox::child::child_inner_main();
+    {
+        // Must happen before any child is forked or re-execed: the inner
+        // instance rebuilds its state from this registry.
+        maki_tools::install_child_workload();
+        if cli.sandbox_inner {
+            maki_sandbox::child::child_inner_main();
+        }
     }
     if let Err(e) = cmd::dispatch(cli) {
         print_error(&e);

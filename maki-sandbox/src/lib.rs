@@ -3,10 +3,10 @@
 pub mod child;
 pub mod error;
 pub mod ipc;
-pub mod lua_runtime;
 pub mod namespace;
 pub mod profiles;
 pub mod sandbox;
+pub mod workload;
 
 use std::collections::HashMap;
 use std::os::unix::io::AsFd;
@@ -39,6 +39,7 @@ pub fn lock_or_poisoned<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_,
 }
 
 pub use sandbox::Sandbox;
+pub use workload::{child_workload, register_child_workload};
 
 /// Spawn a sandboxed child process.
 ///

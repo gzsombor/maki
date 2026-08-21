@@ -1,9 +1,15 @@
+//! Parent-side bridge between the plugin host and the sandbox child.
+//!
+//! Trusted tool calls the child forwards during a run are answered by
+//! invoking the corresponding Lua tool functions from the plugin host.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use maki_agent::tools::interpreter_bridge::build_tool_input;
 use maki_interpreter::runner::InterpreterResult;
+use maki_sandbox::Sandbox;
 use mlua::{Function, Lua, Value as LuaValue};
 
 async fn call_lua_tool(
@@ -23,8 +29,10 @@ async fn call_lua_tool(
     maki_lua::lua_tool_result(values).map_err(|e| format!("{name}: {e}"))
 }
 
-pub(crate) async fn run_sandbox_with(
-    sandbox: &Arc<maki_sandbox::Sandbox>,
+/// Run `code` inside the sandbox child, exposing the given Lua functions as
+/// trusted tools.
+pub async fn run_sandbox_with(
+    sandbox: &Arc<Sandbox>,
     lua: Lua,
     code: String,
     timeout: Duration,

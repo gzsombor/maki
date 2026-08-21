@@ -3,13 +3,10 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::unix::io::{AsFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use maki_interpreter::runner::{self, ToolFn};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::wait::{WaitStatus, waitpid};
@@ -19,28 +16,10 @@ use tracing::{debug, error, warn};
 
 use crate::error::SandboxError;
 use crate::ipc::{self, ChildMsg, DirEntry, NO_CALL_ID, ParentMsg, ToolResultPayload};
-use crate::lua_runtime::ChildLuaRuntime;
 use crate::namespace::{self, NamespaceConfig};
-
-/// Tools that must run in the parent process (network, UI, agent state).
-/// All other tools are executed by local Rust functions inside the sandbox.
-const TRUSTED_TOOLS: &[&str] = &[
-    "webfetch",
-    "websearch",
-    "question",
-    "todo_write",
-    "task",
-    "memory",
-    "skill",
-    "index",
-];
+use crate::workload::{ChildCtx, ChildSession, RunSpec};
 
 const ENV_SANDBOX_FD: &str = "MAKI_SANDBOX_FD";
-
-/// Filesystem tools that execute inside the child via the Lua runtime.
-/// Everything else stays Rust-native (bash) or is forwarded to the parent
-/// (trusted tools), since the child's `maki.*` API is stripped down.
-const CHILD_LOCAL_TOOLS: &[&str] = &["read", "write", "edit", "multiedit", "glob", "grep", "list"];
 
 /// Upper bound for closing extraneous file descriptors in the fork child.
 /// Linux kernels typically limit default FDs to 1024.
@@ -54,21 +33,23 @@ const CANCELED_MSG: &str = "canceled";
 
 type PendingMap = HashMap<u32, Sender<Result<ToolResultPayload, String>>>;
 
-struct RemoteDispatch {
-    next_id: AtomicU32,
-    pending: Mutex<PendingMap>,
-    outgoing: Sender<IoCommand>,
+pub(crate) struct RemoteDispatch {
+    pub(crate) next_id: AtomicU32,
+    pub(crate) pending: Mutex<PendingMap>,
+    pub(crate) outgoing: Sender<IoCommand>,
 }
 
 impl RemoteDispatch {
-    fn lock_pending(&self) -> Result<std::sync::MutexGuard<'_, PendingMap>, SandboxError> {
+    pub(crate) fn lock_pending(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, PendingMap>, SandboxError> {
         self.pending
             .lock()
             .map_err(|e| SandboxError::Ipc(format!("mutex poisoned: {e}")))
     }
 }
 
-enum IoCommand {
+pub(crate) enum IoCommand {
     SendChild(ChildMsg),
 }
 
@@ -218,21 +199,36 @@ enum Work {
     Exit,
 }
 
-struct RunSpec {
-    call_id: u32,
-    code: String,
-    timeout_secs: u64,
-    max_memory: usize,
-    config: String,
-}
-
 /// Runs inside the isolated filesystem after setup.
 ///
 /// One IO thread owns the socket (all reads and all writes), while the main
 /// thread executes blocking work (code runs, tool calls) so slow tools never
-/// stall IPC. The tool map and Lua runtime live only on the worker thread.
+/// stall IPC. The workload session lives only on the worker thread.
 struct InnerChild {
     sock: UnixStream,
+}
+
+/// Session used when no workload is registered: fails runs and tool calls
+/// while keeping query/exec traffic alive.
+struct NoWorkloadSession;
+
+impl ChildSession for NoWorkloadSession {
+    fn run_code(&mut self, _spec: RunSpec) -> crate::ChildIoResult {
+        crate::ChildIoResult {
+            output: None,
+            stdout: String::new(),
+            error: Some("no child workload registered".into()),
+        }
+    }
+
+    fn handle_tool_call(
+        &mut self,
+        _name: &str,
+        _args: Vec<Value>,
+        _kwargs: Vec<(String, Value)>,
+    ) -> Result<String, String> {
+        Err("no child workload registered".into())
+    }
 }
 
 impl InnerChild {
@@ -257,40 +253,17 @@ impl InnerChild {
         });
         let (work_tx, work_rx) = mpsc::channel::<Work>();
 
-        // Load Lua plugins inside the sandbox for filesystem tools
-        let plugin_dir = Path::new("/home/maki/.maki/plugins");
-        let lua_runtime = match ChildLuaRuntime::new(plugin_dir, None) {
-            Ok(rt) => {
-                debug!("sandbox child: lua runtime initialized");
-                Some(Arc::new(rt))
+        let session: Box<dyn ChildSession> = match crate::child_workload() {
+            Some(workload) => {
+                match workload.init(ChildCtx::new(Arc::clone(&dispatch), outgoing_tx.clone())) {
+                    Ok(session) => session,
+                    Err(e) => Self::fatal(&mut self.sock, &e),
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "sandbox child: lua runtime init failed, filesystem tools unavailable");
-                None
-            }
+            // No workload registered (diag/shell binaries): keep query and
+            // exec traffic alive, fail runs and tool calls lazily.
+            None => Box::new(NoWorkloadSession),
         };
-
-        let mut tools = build_bash_tool();
-        let setup = (|| -> Result<(), SandboxError> {
-            if let Some(ref rt) = lua_runtime {
-                tools.extend(build_lua_tools(Arc::clone(rt))?);
-            }
-            tools.extend(build_trusted_tools(Arc::clone(&dispatch))?);
-            Ok(())
-        })();
-        if let Err(e) = setup {
-            error!("sandbox child: tool setup failed: {e}");
-            let _ = ipc::send_child_msg(
-                &mut self.sock,
-                &ChildMsg::Done {
-                    call_id: NO_CALL_ID,
-                    output: None,
-                    stdout: String::new(),
-                    error: Some(e.to_string()),
-                },
-            );
-            std::process::exit(1);
-        }
 
         if let Err(e) = std::thread::Builder::new()
             .name("sandbox-io".into())
@@ -309,64 +282,46 @@ impl InnerChild {
             std::process::exit(1);
         }
 
-        Self::worker_loop(work_rx, outgoing_tx, tools, lua_runtime);
+        Self::worker_loop(work_rx, outgoing_tx, session);
         std::process::exit(0);
+    }
+
+    /// Report a fatal setup failure to the parent and exit.
+    fn fatal(sock: &mut UnixStream, error: &str) -> ! {
+        error!("sandbox child: {error}");
+        let _ = ipc::send_child_msg(
+            sock,
+            &ChildMsg::Done {
+                call_id: NO_CALL_ID,
+                output: None,
+                stdout: String::new(),
+                error: Some(error.to_string()),
+            },
+        );
+        std::process::exit(1);
     }
 
     fn worker_loop(
         work_rx: Receiver<Work>,
         outgoing_tx: Sender<IoCommand>,
-        tools: HashMap<String, ToolFn>,
-        lua_runtime: Option<Arc<ChildLuaRuntime>>,
+        mut session: Box<dyn ChildSession>,
     ) {
         while let Ok(work) = work_rx.recv() {
             match work {
                 Work::Run(spec) => {
-                    if let Some(ref rt) = lua_runtime
-                        && let Err(e) = rt.set_config(&spec.config)
-                    {
-                        warn!(error = %e, "sandbox child: failed to apply run config");
-                    }
-                    let limits =
-                        runner::limits(Duration::from_secs(spec.timeout_secs), spec.max_memory);
                     debug!(
                         call_id = spec.call_id,
                         code_len = spec.code.len(),
                         "sandbox child: running code"
                     );
-                    let outgoing = outgoing_tx.clone();
                     let call_id = spec.call_id;
-                    let result =
-                        runner::run_streaming(&spec.code, &tools, None, limits, &mut |line| {
-                            let _ = outgoing.send(IoCommand::SendChild(ChildMsg::Stdout {
-                                call_id,
-                                text: line.to_string(),
-                            }));
-                        });
-                    match result {
-                        Ok(interp) => {
-                            debug!(call_id = spec.call_id, "sandbox child: run finished");
-                            let _ = outgoing_tx.send(IoCommand::SendChild(ChildMsg::Done {
-                                call_id: spec.call_id,
-                                output: interp.output,
-                                stdout: interp.stdout,
-                                error: None,
-                            }));
-                        }
-                        Err(e) => {
-                            warn!(
-                                call_id = spec.call_id,
-                                error = %e,
-                                "sandbox child: interpreter error"
-                            );
-                            let _ = outgoing_tx.send(IoCommand::SendChild(ChildMsg::Done {
-                                call_id: spec.call_id,
-                                output: None,
-                                stdout: String::new(),
-                                error: Some(format!("interpreter: {e}")),
-                            }));
-                        }
-                    }
+                    let result = session.run_code(spec);
+                    let _ = outgoing_tx.send(IoCommand::SendChild(ChildMsg::Done {
+                        call_id,
+                        output: result.output,
+                        stdout: result.stdout,
+                        error: result.error,
+                    }));
                 }
                 Work::ToolCall {
                     call_id,
@@ -374,13 +329,10 @@ impl InnerChild {
                     args,
                     kwargs,
                 } => {
-                    let result = match tools.get(&name) {
-                        Some(tool) => tool(&name, args, kwargs),
-                        None => Err(format!("unknown tool: {name}")),
-                    };
+                    let result = session.handle_tool_call(&name, args, kwargs);
                     let payload = match result {
                         Ok(output) => ToolResultPayload {
-                            output: Some(output.to_string()),
+                            output: Some(output),
                             error: None,
                         },
                         Err(error) => ToolResultPayload {
@@ -577,138 +529,14 @@ impl IoHandler {
     }
 }
 
-fn build_bash_tool() -> HashMap<String, ToolFn> {
-    let mut tools: HashMap<String, ToolFn> = HashMap::new();
-    tools.insert(
-        "bash".into(),
-        Box::new(|_: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| {
-            let command = require_str(&args, &kwargs, "command")?;
-            let workdir = kwargs
-                .iter()
-                .find(|(k, _)| k == "workdir")
-                .and_then(|(_, v)| v.as_str())
-                .or_else(|| {
-                    args.first()
-                        .and_then(|a| a.get("workdir"))
-                        .and_then(|v| v.as_str())
-                });
-            match sandbox_exec(&command, workdir) {
-                Ok((output, _is_error)) => Ok(Value::String(output)),
-                Err(e) => Err(format!("bash failed: {e}")),
-            }
-        }),
-    );
-    tools
-}
-
-/// Build tool functions from the child-side Lua runtime.
-///
-/// Each registered Lua plugin becomes a `ToolFn` that calls into the
-/// `ChildLuaRuntime`. The Lua plugins run inside the mount namespace,
-/// so filesystem operations are naturally sandboxed.
-fn build_lua_tools(runtime: Arc<ChildLuaRuntime>) -> Result<HashMap<String, ToolFn>, SandboxError> {
-    let mut tools = HashMap::new();
-
-    // Get the list of registered tool names from the Lua runtime
-    let names = runtime
-        .registered_tool_names()
-        .map_err(|e| SandboxError::Ipc(format!("lua_runtime: cannot list tools: {e}")))?;
-
-    for name in names {
-        if !CHILD_LOCAL_TOOLS.contains(&name.as_str()) {
-            debug!(tool = %name, "build_lua_tools: not child-local, skipping");
-            continue;
-        }
-        let rt = Arc::clone(&runtime);
-        let tool_name = name.clone();
-        tools.insert(
-            name,
-            Box::new(
-                move |_fn_name: &str, args: Vec<Value>, kwargs: Vec<(String, Value)>| match rt
-                    .call_tool(&tool_name, &args, &kwargs)
-                {
-                    Ok((output, is_error)) => {
-                        if is_error {
-                            Err(output)
-                        } else {
-                            Ok(Value::String(output))
-                        }
-                    }
-                    Err(e) => Err(e),
-                },
-            ) as ToolFn,
-        );
-    }
-
-    Ok(tools)
-}
-
-fn build_trusted_tools(
-    dispatch: Arc<RemoteDispatch>,
-) -> Result<HashMap<String, ToolFn>, SandboxError> {
-    let mut tools: HashMap<String, ToolFn> = HashMap::new();
-    for name in TRUSTED_TOOLS {
-        let d = Arc::clone(&dispatch);
-        tools.insert(
-            name.to_string(),
-            Box::new(move |fn_name: &str, args, kwargs| {
-                let call_id = d.next_id.fetch_add(1, Ordering::SeqCst);
-                let (tx, rx) = mpsc::channel();
-
-                // Single lock scope: insert, send, then handle response.
-                {
-                    let mut pending = d.lock_pending().map_err(|e| e.to_string())?;
-                    pending.insert(call_id, tx);
-
-                    if d.outgoing
-                        .send(IoCommand::SendChild(ChildMsg::ToolCall {
-                            call_id,
-                            name: fn_name.to_string(),
-                            args,
-                            kwargs,
-                        }))
-                        .is_err()
-                    {
-                        pending.remove(&call_id);
-                        return Err("io thread disconnected".into());
-                    }
-                }
-
-                match rx.recv() {
-                    Ok(Ok(payload)) => {
-                        d.lock_pending()
-                            .map_err(|e| e.to_string())?
-                            .remove(&call_id);
-                        if let Some(err) = payload.error {
-                            Err(err)
-                        } else {
-                            Ok(Value::String(payload.output.unwrap_or_default()))
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        d.lock_pending()
-                            .map_err(|e| e.to_string())?
-                            .remove(&call_id);
-                        Err(err)
-                    }
-                    Err(_) => {
-                        d.lock_pending()
-                            .map_err(|e| e.to_string())?
-                            .remove(&call_id);
-                        Err("io thread disconnected".into())
-                    }
-                }
-            }),
-        );
-    }
-    Ok(tools)
-}
-
 /// Execute a shell command via fork+execve, capturing combined stdout+stderr.
 ///
 /// Uses raw fork/execve instead of `std::process::Command` because the latter
 /// uses `posix_spawnp` which fails with ENOENT inside user+mount namespaces.
-fn sandbox_exec(command: &str, workdir: Option<&str>) -> Result<(String, bool), SandboxError> {
+pub(crate) fn sandbox_exec(
+    command: &str,
+    workdir: Option<&str>,
+) -> Result<(String, bool), SandboxError> {
     let (pipe_r, pipe_w) = pipe().map_err(|e| SandboxError::Exec(format!("pipe failed: {e}")))?;
     let pipe_r = pipe_r.into_raw_fd();
     let pipe_w = pipe_w.into_raw_fd();
@@ -800,96 +628,10 @@ fn list_dir_entries(path: &str) -> Vec<DirEntry> {
     entries
 }
 
-fn require_str(args: &[Value], kwargs: &[(String, Value)], name: &str) -> Result<String, String> {
-    if let Some(val) = kwargs.iter().find(|(k, _)| k == name).map(|(_, v)| v) {
-        return val
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| format!("{name} must be a string"));
-    }
-    if let Some(first) = args.first() {
-        if let Some(s) = first.as_str() {
-            return Ok(s.to_string());
-        }
-        // LLM sends the whole input object as args[0]; unwrap it.
-        if let Some(val) = first.get(name) {
-            return val
-                .as_str()
-                .map(String::from)
-                .ok_or_else(|| format!("{name} must be a string"));
-        }
-        return Err("first arg must be a string".to_string());
-    }
-    Err(format!("missing required argument: {name}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use tempfile::TempDir;
-
-    const MISSING_ARG: &str = "missing required argument";
-
-    #[test]
-    fn require_str_from_kwargs() {
-        let args: Vec<Value> = vec![];
-        let kwargs = vec![("path".into(), json!("/foo/bar"))];
-        let result = require_str(&args, &kwargs, "path");
-        assert_eq!(result.unwrap(), "/foo/bar");
-    }
-
-    #[test]
-    fn require_str_from_positional() {
-        let args = vec![json!("/positional")];
-        let kwargs: Vec<(String, Value)> = vec![];
-        let result = require_str(&args, &kwargs, "path");
-        assert_eq!(result.unwrap(), "/positional");
-    }
-
-    #[test]
-    fn require_str_missing_returns_error() {
-        let args: Vec<Value> = vec![];
-        let kwargs: Vec<(String, Value)> = vec![];
-        let err = require_str(&args, &kwargs, "path").unwrap_err();
-        assert!(
-            err.contains(MISSING_ARG),
-            "expected missing arg error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn require_str_non_string_returns_error() {
-        let args: Vec<Value> = vec![];
-        let kwargs = vec![("path".into(), json!(42))];
-        let err = require_str(&args, &kwargs, "path").unwrap_err();
-        assert!(
-            err.contains("must be a string"),
-            "expected type error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn require_str_from_object_in_args() {
-        let args = vec![json!({"command": "ls -la", "workdir": "/tmp"})];
-        let kwargs: Vec<(String, Value)> = vec![];
-        assert_eq!(require_str(&args, &kwargs, "command").unwrap(), "ls -la");
-    }
-
-    #[test]
-    fn require_str_object_missing_key_errors() {
-        let args = vec![json!({"other": "x"})];
-        let kwargs: Vec<(String, Value)> = vec![];
-        assert!(require_str(&args, &kwargs, "command").is_err());
-    }
-
-    #[test]
-    fn require_str_kwargs_takes_priority() {
-        let args = vec![json!("/positional")];
-        let kwargs = vec![("path".into(), json!("/from_kwargs"))];
-        let result = require_str(&args, &kwargs, "path");
-        assert_eq!(result.unwrap(), "/from_kwargs");
-    }
 
     #[test]
     fn list_dir_entries_dirs_first_then_alpha() {

@@ -197,7 +197,7 @@ fn build_stack(
                 let sandbox = Arc::clone(&sandbox_for_runner);
                 let config_json = config_json.clone();
                 Box::pin(async move {
-                    crate::sandbox::run_sandbox_with(&sandbox, lua, code, timeout, fns, config_json)
+                    maki_tools::run_sandbox_with(&sandbox, lua, code, timeout, fns, config_json)
                         .await
                 })
             });

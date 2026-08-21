@@ -2526,6 +2526,7 @@ dependencies = [
  "maki-providers",
  "maki-sandbox",
  "maki-storage",
+ "maki-tools",
  "maki-ui",
  "mlua",
  "open",
@@ -2798,11 +2799,7 @@ dependencies = [
 name = "maki-sandbox"
 version = "0.4.11"
 dependencies = [
- "include_dir",
  "libc",
- "maki-agent",
- "maki-interpreter",
- "mlua",
  "nix",
  "serde",
  "serde_json",
@@ -2828,6 +2825,23 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "maki-tools"
+version = "0.4.11"
+dependencies = [
+ "futures-lite",
+ "include_dir",
+ "maki-agent",
+ "maki-interpreter",
+ "maki-lua",
+ "maki-sandbox",
+ "mlua",
+ "serde_json",
+ "smol",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

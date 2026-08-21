@@ -1,5 +1,3 @@
-use maki_interpreter::error::InterpreterError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     #[error("fork failed: {0}")]
@@ -13,9 +11,6 @@ pub enum SandboxError {
 
     #[error("IPC error: {0}")]
     Ipc(String),
-
-    #[error("interpreter error: {0}")]
-    Interpreter(#[from] InterpreterError),
 
     #[error("environment setup failed: {0}")]
     Env(String),
