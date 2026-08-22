@@ -45,5 +45,15 @@ fn sandbox_shell_exec() {
         output.contains("/usr/bin"),
         "PATH should contain /usr/bin, got: {output}"
     );
+
+    // Regression: opening /dev/null used to fail with EACCES because devices
+    // were bound over placeholders on a tmpfs mounted inside the user ns.
+    let (output, is_error) = sandbox.exec("echo visible 2>/dev/null").expect(EXEC_FAILED);
+    assert!(!is_error, "redirect to /dev/null should succeed");
+    assert_eq!(
+        output.trim(),
+        "visible",
+        "stdout must survive a stderr redirect to /dev/null"
+    );
     // sandbox dropped here — Drop sends Exit and waits for child
 }

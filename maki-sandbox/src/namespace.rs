@@ -15,11 +15,10 @@ use crate::ipc::{self, SYNC_GO, SYNC_READY};
 
 pub const DEFAULT_ALLOWED_ENV: &[&str] = &["LANG", "TERM", "TMPDIR", "RUST_LOG"];
 
-/// Flags for every tmpfs mounted inside the sandbox. Explicit `nosuid|nodev`
-/// is required: mounts created without them in a user namespace silently
-/// block opening device nodes bind-mounted on top of them (open fails with
-/// EACCES), which breaks `/dev/null`. Mirrors what bubblewrap does.
+/// Flags for every tmpfs mounted inside the sandbox. Mirrors what bubblewrap does.
 const TMPFS_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
+
+const DEVICE_NAMES: &[&str] = &["null", "zero", "full", "random", "urandom", "console"];
 
 const ENV_DESCRIPTIONS: &[(&str, &str)] = &[
     ("LANG", "locale"),
@@ -391,10 +390,39 @@ fn staging_dir(pid: u32) -> String {
     format!("/tmp/.maki-root-{pid}")
 }
 
-/// Remove the staging tree left behind by an exited child. Its mounts died
+/// Host-side staging dir for device nodes, keyed by the child's pid like
+/// [`staging_dir`]. Placeholders live here (on the host filesystem), devices
+/// are bound over them, and the whole dir is rbound into the sandbox as /dev.
+fn device_stage_dir(pid: u32) -> String {
+    format!("/tmp/.maki-dev-{pid}")
+}
+
+/// Bind host device nodes onto placeholder files in the device stage dir.
+/// Per-device failures are warned about and skipped, matching the old
+/// bind-into-tmpfs behavior.
+fn prepare_device_stage() -> Result<String, SandboxError> {
+    let dir = device_stage_dir(std::process::id());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| SandboxError::Mount(format!("create device stage {dir}: {e}")))?;
+    for name in DEVICE_NAMES {
+        let host_dev = format!("/dev/{name}");
+        if !Path::new(&host_dev).exists() {
+            continue;
+        }
+        if let Err(e) = bind_mount_device(Path::new(&host_dev), &format!("{dir}/{name}")) {
+            warn!("sandbox: stage /dev/{name} failed ({e}), continuing");
+        }
+    }
+    Ok(dir)
+}
+
+/// Remove the staging trees left behind by an exited child. Its mounts died
 /// with its mount namespace; only plain directories remain on /tmp.
 pub(crate) fn cleanup_staging(pid: Pid) {
-    let _ = std::fs::remove_dir_all(staging_dir(pid.as_raw() as u32));
+    let pid = pid.as_raw() as u32;
+    let _ = std::fs::remove_dir_all(staging_dir(pid));
+    let _ = std::fs::remove_dir_all(device_stage_dir(pid));
 }
 
 fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(), SandboxError> {
@@ -441,27 +469,20 @@ fn setup_mounts_impl(config: &NamespaceConfig, has_mount_ns: bool) -> Result<(),
             .map_err(|e| SandboxError::Mount(format!("create dir {path}: {e}")))?;
     }
 
-    // Mount tmpfs on /dev, then populate with device nodes.
+    // Device nodes are staged on the host filesystem and rbound in as a
+    // directory: a device bind-mounted over a file on a tmpfs created inside
+    // this user namespace cannot be opened (EACCES), while the same bind on
+    // an init-namespace filesystem works.
+    let dev_stage = prepare_device_stage()?;
     let dev_path = format!("{staging}/dev");
     mount(
-        Some("tmpfs"),
+        Some(dev_stage.as_str()),
         dev_path.as_str(),
-        Some("tmpfs"),
-        TMPFS_FLAGS,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
     )
-    .map_err(|e| SandboxError::Mount(format!("mount tmpfs /dev: {e}")))?;
-
-    // Bind-mount critical device files from host (mknod fails in user namespaces without CAP_MKNOD)
-    for name in &["null", "zero", "full", "random", "urandom", "console"] {
-        let host_dev = format!("/dev/{name}");
-        let target = format!("{dev_path}/{name}");
-        if Path::new(&host_dev).exists()
-            && let Err(e) = bind_mount_device(Path::new(&host_dev), &target)
-        {
-            warn!("sandbox: bind-mount /dev/{name} failed ({e}), continuing");
-        }
-    }
+    .map_err(|e| SandboxError::Mount(format!("rbind {dev_stage} -> {dev_path}: {e}")))?;
 
     // Create /dev symlinks
     let dev_symlinks: &[(&str, &str)] = &[
