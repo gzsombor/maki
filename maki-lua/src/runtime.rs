@@ -117,26 +117,6 @@ const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 pub type SandboxRouter =
     dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<String, String> + Send + Sync;
 
-/// Tools that always run on the host even when sandbox mode is on: they
-/// need session state, TUI interaction, or machinery the sandbox child
-/// cannot provide. This is an allowlist on purpose — any tool not listed
-/// here (including tools added later) defaults to running inside the
-/// sandbox child. If the child cannot run a routed tool it answers with
-/// [`UNKNOWN_TOOL_PREFIX`](maki_agent::agent::UNKNOWN_TOOL_PREFIX) and we
-/// transparently fall back to the host plugin.
-const SANDBOX_HOST_TOOLS: &[&str] = &[
-    "batch",
-    "code_execution",
-    "index",
-    "memory",
-    "question",
-    "skill",
-    "task",
-    "todo_write",
-    "webfetch",
-    "websearch",
-];
-
 /// Splits a JSON input value into the (args, kwargs) form expected by the
 /// sandbox child's native tool handlers. Objects are flattened into kwargs;
 /// non-object values are passed as a single positional arg.
@@ -175,6 +155,13 @@ async fn sandbox_routed_reply(
         Ok(Err(e)) => ToolCallReply::err(e),
         Err(message) => ToolCallReply::err(message),
     })
+}
+
+/// Routing policy for a tool call: only a tool that declared
+/// `host_access = true` stays on the host. Everything else, including tools a
+/// later load adds, runs inside the sandbox while it is enabled.
+fn routes_into_sandbox(host_access: bool, sandbox_enabled: bool) -> bool {
+    sandbox_enabled && !host_access
 }
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
@@ -2013,6 +2000,9 @@ struct ToolKeys {
     start: Option<RegistryKey>,
     permission_scopes: Option<RegistryKey>,
     describe: Option<RegistryKey>,
+    /// Declared at registration. True keeps the handler on the host even when
+    /// the sandbox is on; false (the default) routes the call into the sandbox.
+    host_access: bool,
 }
 
 struct PluginOwner {
@@ -2570,6 +2560,7 @@ impl LuaRuntime {
                         start: t.start_key,
                         permission_scopes: t.permission.and_then(|p| p.scopes.callback_key()),
                         describe: t.describe_key,
+                        host_access: t.host_access,
                     },
                 )
             })
@@ -3243,7 +3234,14 @@ async fn run_tool_call(
     if shutdown.load(Ordering::Acquire) {
         return ToolCallReply::err("plugin host shutting down");
     }
-    if !SANDBOX_HOST_TOOLS.contains(&tool.as_ref()) && ctx.sandbox_enabled() {
+    let host_access = {
+        let plugins_ref = plugins.borrow();
+        plugins_ref
+            .get(&*plugin)
+            .and_then(|owner| owner.tools.get(&*tool))
+            .is_some_and(|keys| keys.host_access)
+    };
+    if routes_into_sandbox(host_access, ctx.sandbox_enabled()) {
         if let Some(reply) = sandbox_routed_reply(&lua, &tool, &input, &ctx.cancel).await {
             return reply;
         }
@@ -3952,27 +3950,14 @@ mod tests {
     use std::task::Poll;
     use test_case::test_case;
 
-    /// The routing default is "inside the sandbox": the host list must never
-    /// contain a filesystem tool, or cargo-style fs work would silently
-    /// escape the namespace.
-    #[test]
-    fn sandbox_host_tools_exclude_filesystem_tools() {
-        for tool in [
-            "bash",
-            "read",
-            "write",
-            "edit",
-            "multiedit",
-            "glob",
-            "grep",
-            "list",
-        ] {
-            assert!(
-                !SANDBOX_HOST_TOOLS.contains(&tool),
-                "{tool} must route into the sandbox"
-            );
-        }
-        assert_eq!(SANDBOX_HOST_TOOLS.len(), 10);
+    /// Tools route into the sandbox unless they opted out with `host_access`;
+    /// with the sandbox off nothing is routed, whatever the declaration.
+    #[test_case(false, true, true ; "default_routes_into_sandbox")]
+    #[test_case(true, true, false ; "host_access_stays_on_host")]
+    #[test_case(false, false, false ; "sandbox_off_stays_on_host")]
+    #[test_case(true, false, false ; "host_access_with_sandbox_off_stays_on_host")]
+    fn routing_policy(host_access: bool, sandbox_enabled: bool, routed: bool) {
+        assert_eq!(routes_into_sandbox(host_access, sandbox_enabled), routed);
     }
 
     fn make_buf_handle(text: &str) -> BufHandle {
