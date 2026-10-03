@@ -8,7 +8,7 @@ use std::sync::Arc;
 use maki_agent::AgentConfig;
 use maki_fs::{JobSink, JobStream};
 use maki_sandbox::Sandbox;
-use maki_sandbox::ipc::DirEntry;
+use maki_sandbox::ipc::{DirEntry, RunId};
 use maki_sandbox::namespace::{EnvEntry, NamespaceConfig};
 use maki_sandbox::profiles::{self, MountUsage, SandboxProfile};
 
@@ -64,10 +64,10 @@ pub(crate) enum SandboxModalEvent {
     /// Shell tab requested a fresh child; carries the working directory.
     ShellReady(String),
     /// One output line of a shell command, as the command wrote it.
-    ExecLine { run: u64, line: String },
+    ExecLine { run: RunId, line: String },
     /// A shell command finished. `run` names the entry its output belongs to.
     Executed {
-        run: u64,
+        run: RunId,
         result: Result<i32, String>,
     },
     /// Child respawn for a config change finished.
@@ -227,7 +227,7 @@ fn expand_home(path: &str) -> String {
 /// run while it happens instead of when it ends.
 struct ShellLines {
     tx: flume::Sender<SandboxModalEvent>,
-    run: u64,
+    run: RunId,
 }
 
 impl JobSink for ShellLines {
@@ -245,7 +245,7 @@ impl JobSink for ShellLines {
 /// A single entry in the shell output history. `run` tells which run of the
 /// shell its lines belong to, so several commands in flight never mix.
 struct ShellEntry {
-    run: u64,
+    run: RunId,
     command: String,
     output: String,
     is_error: bool,
@@ -258,7 +258,6 @@ struct SandboxShellState {
     cwd: String,
     input: String,
     entries: Vec<ShellEntry>,
-    next_run: u64,
     history: Vec<String>,
     history_pos: Option<usize>,
     error: Option<String>,
@@ -270,7 +269,6 @@ impl SandboxShellState {
             cwd: pwd,
             input: String::new(),
             entries: Vec::new(),
-            next_run: 0,
             history: Vec::new(),
             history_pos: None,
             error: None,
@@ -278,10 +276,8 @@ impl SandboxShellState {
     }
 
     /// Record a command as started, so its lines have somewhere to land while
-    /// it runs. Returns the run id they will carry.
-    fn start(&mut self, command: String) -> u64 {
-        let run = self.next_run;
-        self.next_run += 1;
+    /// it runs.
+    fn start(&mut self, run: RunId, command: String) {
         self.entries.push(ShellEntry {
             run,
             command,
@@ -289,11 +285,10 @@ impl SandboxShellState {
             is_error: false,
         });
         self.error = None;
-        run
     }
 
     /// Append one streamed line to the run that wrote it.
-    fn push_line(&mut self, run: u64, line: String) {
+    fn push_line(&mut self, run: RunId, line: String) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.run == run) {
             entry.output.push_str(&line);
             entry.output.push('\n');
@@ -302,7 +297,7 @@ impl SandboxShellState {
 
     /// Close a run out: a command that ran reports whether it failed, one that
     /// could not run at all reports why.
-    fn finish(&mut self, run: u64, result: Result<i32, String>) {
+    fn finish(&mut self, run: RunId, result: Result<i32, String>) {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.run == run) else {
             return;
         };
@@ -886,14 +881,18 @@ impl SandboxModal {
     /// untracked: several may be in flight and each one's lines go to the entry
     /// that started it.
     fn exec_command(&mut self, command: String) {
-        let Some(shell) = &mut self.shell else {
+        let Some(sandbox) = self.sandbox.clone() else {
+            if let Some(shell) = &mut self.shell {
+                shell.error = Some("sandbox unavailable".into());
+            }
             return;
         };
         // The entry goes in before the job starts, so the transcript shows the
         // command while it runs instead of appearing with its output at the end.
-        let run = shell.start(command.clone());
-        let (Some(tx), Some(sandbox)) = (self.event_tx.clone(), self.sandbox.clone()) else {
-            shell.error = Some("sandbox unavailable".into());
+        let Some(run) = self.start_run(command.clone()) else {
+            return;
+        };
+        let Some(tx) = self.event_tx.clone() else {
             return;
         };
         smol::unblock(move || {
@@ -902,11 +901,21 @@ impl SandboxModal {
                 run,
             });
             let result = sandbox
-                .exec_streaming(&command, None, Some(MODAL_EXEC_TIMEOUT_SECS), sink)
+                .exec_streaming(run, &command, None, Some(MODAL_EXEC_TIMEOUT_SECS), sink)
                 .map_err(|e| e.to_string());
             let _ = tx.send(SandboxModalEvent::Executed { run, result });
         })
         .detach();
+    }
+
+    /// Give the shell an entry for a command about to run and return the id
+    /// its lines will carry. The sandbox hands those out, so a command that
+    /// outlives the tab it was started in cannot land its lines in the shell
+    /// that replaces it.
+    fn start_run(&mut self, command: String) -> Option<RunId> {
+        let run = self.sandbox.as_ref()?.next_run();
+        self.shell.as_mut()?.start(run, command);
+        Some(run)
     }
 
     /// Apply a finished background job to the modal state. Stale events
@@ -2107,7 +2116,8 @@ mod tests {
     }
 
     fn shell_modal() -> SandboxModal {
-        let mut modal = SandboxModal::new(info_with(true, 0), None);
+        let mut modal =
+            SandboxModal::new(info_with(true, 0), Some(Arc::new(Sandbox::without_child())));
         modal.mode = Mode::Shell;
         modal.shell = Some(SandboxShellState::new("/".into()));
         modal
@@ -2143,7 +2153,7 @@ mod tests {
     #[test]
     fn shell_output_is_shown_before_the_command_finishes() {
         let mut modal = shell_modal();
-        let run = modal.shell.as_mut().unwrap().start("repeat.sh".into());
+        let run = modal.start_run("repeat.sh".into()).unwrap();
 
         modal.apply(SandboxModalEvent::ExecLine {
             run,
@@ -2160,14 +2170,41 @@ mod tests {
         );
     }
 
+    /// A command that outlives the tab it was started in must not write into
+    /// the shell that replaced it.
+    #[test]
+    fn a_line_from_a_closed_tab_is_dropped() {
+        let mut modal = shell_modal();
+        let stale = modal.start_run("long.sh".into()).unwrap();
+        modal.close_shell();
+        modal.pending = Some(PendingJob::Shell);
+        modal.apply(SandboxModalEvent::ShellReady("/".into()));
+
+        let current = modal.start_run("ls".into()).unwrap();
+        assert_ne!(stale, current, "a reopened shell does not reuse run ids");
+        modal.apply(SandboxModalEvent::ExecLine {
+            run: stale,
+            line: "from the closed tab".into(),
+        });
+        modal.apply(SandboxModalEvent::ExecLine {
+            run: current,
+            line: "from this one".into(),
+        });
+
+        assert_eq!(
+            modal.shell.as_ref().unwrap().entries[0].output,
+            "from this one\n",
+            "a stale run has no entry to land in"
+        );
+    }
+
     /// Execs are untracked, so several may be in flight: each line goes to the
     /// run that wrote it.
     #[test]
     fn lines_land_in_the_run_that_wrote_them() {
         let mut modal = shell_modal();
-        let shell = modal.shell.as_mut().unwrap();
-        let first = shell.start("first.sh".into());
-        let second = shell.start("second.sh".into());
+        let first = modal.start_run("first.sh".into()).unwrap();
+        let second = modal.start_run("second.sh".into()).unwrap();
 
         modal.apply(SandboxModalEvent::ExecLine {
             run: second,
@@ -2186,9 +2223,8 @@ mod tests {
     #[test]
     fn a_nonzero_exit_marks_only_its_own_entry_as_an_error() {
         let mut modal = shell_modal();
-        let shell = modal.shell.as_mut().unwrap();
-        let first = shell.start("echo hi".into());
-        let second = shell.start("false".into());
+        let first = modal.start_run("echo hi".into()).unwrap();
+        let second = modal.start_run("false".into()).unwrap();
 
         modal.apply(SandboxModalEvent::Executed {
             run: second,
@@ -2210,7 +2246,7 @@ mod tests {
     #[test]
     fn a_command_that_could_not_run_reports_why() {
         let mut modal = shell_modal();
-        let run = modal.shell.as_mut().unwrap().start("nope".into());
+        let run = modal.start_run("nope".into()).unwrap();
         modal.apply(SandboxModalEvent::Executed {
             run,
             result: Err("child gone".into()),

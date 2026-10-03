@@ -16,6 +16,9 @@ required-features = ["sandbox"]
 [features]
 default = ["sandbox"]
 sandbox = []
+## Exposes constructors for tests in other crates (e.g. maki-ui) that need a
+## handle without a sandbox child behind it.
+testing = []
 
 [dependencies]
 maki-fs = { workspace = true }

@@ -21,7 +21,7 @@ use nix::unistd::{ForkResult, Pid, getgid, getuid};
 use tracing::{debug, error, warn};
 
 use crate::error::SandboxError;
-use crate::ipc::{ChildMsg, DirEntry, FsResult, ParentMsg, SYNC_GO, SYNC_READY};
+use crate::ipc::{ChildMsg, DirEntry, FsResult, ParentMsg, RunId, SYNC_GO, SYNC_READY};
 use crate::namespace::NamespaceConfig;
 
 /// Socket poll timeout in the parent's IO thread, in milliseconds.
@@ -141,18 +141,18 @@ pub enum SandboxResponse {
     Fs(FsResult),
 }
 
-pub type PendingMap = HashMap<u32, Sender<Result<SandboxResponse, String>>>;
+pub type PendingMap = HashMap<RunId, Sender<Result<SandboxResponse, String>>>;
 
-/// Where the output of a running command goes, by the `Exec` call that asked
-/// for it. The child streams lines for one call at a time, and the IO thread
-/// drops the entry when that call reports its exit.
-pub type StreamMap = HashMap<u32, Arc<dyn JobSink>>;
+/// Where the output of a running command goes, by the [`RunId`] of the `Exec`
+/// that asked for it. The child streams lines for one run at a time, and the
+/// IO thread drops the entry when that run reports its exit.
+pub type StreamMap = HashMap<RunId, Arc<dyn JobSink>>;
 
 /// Parent-side IO handler for the sandbox child process.
 ///
 /// Runs in a dedicated thread that owns the IPC socket: it sends queued
 /// [`ParentMsg`] requests and routes every [`ChildMsg`] back to the pending
-/// waiter for its call id.
+/// waiter for its run id.
 struct ParentIo {
     sock: UnixStream,
     inbound: Receiver<ParentMsg>,
@@ -249,48 +249,44 @@ impl ParentIo {
                 warn!(detail, "sandbox parent io: setup message after startup");
                 false
             }
-            ChildMsg::LsResult { call_id, entries } => {
-                self.deliver(call_id, Ok(SandboxResponse::Ls(entries)));
+            ChildMsg::LsResult { run, entries } => {
+                self.deliver(run, Ok(SandboxResponse::Ls(entries)));
                 true
             }
-            ChildMsg::PwdResult { call_id, path } => {
-                self.deliver(call_id, Ok(SandboxResponse::Pwd(path)));
+            ChildMsg::PwdResult { run, path } => {
+                self.deliver(run, Ok(SandboxResponse::Pwd(path)));
                 true
             }
-            ChildMsg::CdResult { call_id, error } => {
-                self.deliver(call_id, error.map_or(Ok(SandboxResponse::Cd), Err));
+            ChildMsg::CdResult { run, error } => {
+                self.deliver(run, error.map_or(Ok(SandboxResponse::Cd), Err));
                 true
             }
-            ChildMsg::ExecLine {
-                call_id,
-                stream,
-                line,
-            } => {
-                self.stream(call_id, stream, line);
+            ChildMsg::ExecLine { run, stream, line } => {
+                self.stream(run, stream, line);
                 true
             }
-            ChildMsg::ExecResult { call_id, exit_code } => {
+            ChildMsg::ExecResult { run, exit_code } => {
                 // The run is over, so nobody will stream into that call again.
-                drop(lock_or_poisoned(&self.streams).map(|mut s| s.remove(&call_id)));
-                self.deliver(call_id, Ok(SandboxResponse::Exec(exit_code)));
+                drop(lock_or_poisoned(&self.streams).map(|mut s| s.remove(&run)));
+                self.deliver(run, Ok(SandboxResponse::Exec(exit_code)));
                 true
             }
-            ChildMsg::FsResult { call_id, result } => {
-                self.deliver(call_id, Ok(SandboxResponse::Fs(result)));
+            ChildMsg::FsResult { run, result } => {
+                self.deliver(run, Ok(SandboxResponse::Fs(result)));
                 true
             }
         }
     }
 
-    /// Hand one output line to the sink waiting on `call_id`, if any. A line
+    /// Hand one output line to the sink waiting on `run`, if any. A line
     /// with no waiter is a command whose caller gave up on it, which is not a
     /// reason to stop the child: the same reader serves the next call.
     ///
     /// The sink is called outside the lock: it belongs to the caller, and one
     /// that calls back into the sandbox would otherwise deadlock this thread.
-    fn stream(&self, call_id: u32, stream: JobStream, line: String) {
+    fn stream(&self, run: RunId, stream: JobStream, line: String) {
         let sink = match lock_or_poisoned(&self.streams) {
-            Ok(sinks) => sinks.get(&call_id).cloned(),
+            Ok(sinks) => sinks.get(&run).cloned(),
             Err(e) => {
                 warn!("sandbox parent io: stream mutex poisoned: {e}");
                 return;
@@ -298,19 +294,19 @@ impl ParentIo {
         };
         match sink {
             Some(sink) => sink.line(stream, line),
-            None => debug!(call_id, "sandbox parent io: line for no watcher"),
+            None => debug!(%run, "sandbox parent io: line for no watcher"),
         }
     }
 
-    fn deliver(&self, call_id: u32, response: Result<SandboxResponse, String>) {
+    fn deliver(&self, run: RunId, response: Result<SandboxResponse, String>) {
         match self.pending.lock() {
             Ok(mut pending) => {
-                if let Some(tx) = pending.remove(&call_id) {
+                if let Some(tx) = pending.remove(&run) {
                     if tx.send(response).is_err() {
-                        debug!(call_id, "sandbox parent io: waiter gone");
+                        debug!(%run, "sandbox parent io: waiter gone");
                     }
                 } else {
-                    debug!(call_id, "sandbox parent io: no pending waiter");
+                    debug!(%run, "sandbox parent io: no pending waiter");
                 }
             }
             Err(e) => warn!("sandbox parent io: pending mutex poisoned: {e}"),
@@ -322,8 +318,8 @@ impl ParentIo {
             streams.clear();
         }
         if let Ok(mut pending) = self.pending.lock() {
-            for (call_id, tx) in pending.drain() {
-                debug!(call_id, "sandbox parent io: failing pending waiter");
+            for (run, tx) in pending.drain() {
+                debug!(%run, "sandbox parent io: failing pending waiter");
                 let _ = tx.send(Err(message.to_string()));
             }
         }
@@ -339,8 +335,8 @@ mod tests {
 
     use super::*;
 
-    const A_CALL: u32 = 7;
-    const ANOTHER_CALL: u32 = 8;
+    const A_RUN: RunId = RunId(7);
+    const ANOTHER_RUN: RunId = RunId(8);
     const NO_CALL: &str = "the sandbox io thread stopped routing";
 
     #[derive(Default)]
@@ -369,11 +365,11 @@ mod tests {
     /// exit.
     type Watcher = Receiver<Result<SandboxResponse, String>>;
 
-    fn watching(io: &ParentIo, call_id: u32) -> (Arc<Sink>, Watcher) {
+    fn watching(io: &ParentIo, run: RunId) -> (Arc<Sink>, Watcher) {
         let sink = Arc::new(Sink::default());
         let (tx, rx) = channel();
-        io.streams.lock().unwrap().insert(call_id, sink.clone());
-        io.pending.lock().unwrap().insert(call_id, tx);
+        io.streams.lock().unwrap().insert(run, sink.clone());
+        io.pending.lock().unwrap().insert(run, tx);
         (sink, rx)
     }
 
@@ -383,16 +379,16 @@ mod tests {
     #[test]
     fn an_exec_line_reaches_the_sink_of_its_call() {
         let mut io = io();
-        let (first, _waiting) = watching(&io, A_CALL);
-        let (second, _other_waiting) = watching(&io, ANOTHER_CALL);
+        let (first, _waiting) = watching(&io, A_RUN);
+        let (second, _other_waiting) = watching(&io, ANOTHER_RUN);
 
         assert!(io.route(ChildMsg::ExecLine {
-            call_id: A_CALL,
+            run: A_RUN,
             stream: JobStream::Stdout,
             line: "one".into(),
         }));
         assert!(io.route(ChildMsg::ExecLine {
-            call_id: ANOTHER_CALL,
+            run: ANOTHER_RUN,
             stream: JobStream::Stderr,
             line: "two".into(),
         }));
@@ -414,10 +410,10 @@ mod tests {
     #[test]
     fn an_exec_result_answers_the_waiter_and_closes_the_stream() {
         let mut io = io();
-        let (sink, waiting) = watching(&io, A_CALL);
+        let (sink, waiting) = watching(&io, A_RUN);
 
         assert!(io.route(ChildMsg::ExecResult {
-            call_id: A_CALL,
+            run: A_RUN,
             exit_code: 3,
         }));
         assert!(
@@ -429,7 +425,7 @@ mod tests {
         );
 
         io.route(ChildMsg::ExecLine {
-            call_id: A_CALL,
+            run: A_RUN,
             stream: JobStream::Stdout,
             line: "late".into(),
         });
@@ -445,7 +441,7 @@ mod tests {
     fn a_line_for_no_watcher_does_not_stop_the_routing() {
         let mut io = io();
         assert!(io.route(ChildMsg::ExecLine {
-            call_id: ANOTHER_CALL,
+            run: ANOTHER_RUN,
             stream: JobStream::Stdout,
             line: "orphan".into(),
         }));

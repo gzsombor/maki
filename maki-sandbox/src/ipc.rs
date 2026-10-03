@@ -1,6 +1,7 @@
 use maki_fs::JobStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use tracing::debug;
@@ -10,9 +11,19 @@ use crate::error::SandboxError;
 pub const HANDSHAKE_VERSION: u32 = 2;
 pub const MAX_MSG_LEN: usize = 16 * 1024 * 1024;
 
-/// Call id used for messages that carry no associated request
-/// (e.g. a fatal child error reported before any request was sent).
-pub const NO_CALL_ID: u32 = 0;
+/// Identifies one request a sandbox is serving. Handed out by
+/// [`Sandbox::next_run`](crate::Sandbox::next_run) and opaque outside this
+/// crate, so the id a caller labels its own bookkeeping with is the same id
+/// the child echoes and the parent routes on.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct RunId(pub(crate) u64);
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RunId({})", self.0)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Handshake {
@@ -89,7 +100,7 @@ pub fn recv_sync(sock: &mut UnixStream, expected: &[u8]) -> Result<(), SandboxEr
 
 /// Messages sent by the parent to the persistent sandbox child.
 ///
-/// Every request carries a `call_id`; the child echoes it in the matching
+/// Every request carries a [`RunId`]; the child echoes it in the matching
 /// response so the parent routes results by id.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -97,16 +108,16 @@ pub enum ParentMsg {
     #[serde(rename = "exit")]
     Exit,
     #[serde(rename = "ls")]
-    Ls { call_id: u32, path: String },
+    Ls { run: RunId, path: String },
     #[serde(rename = "pwd")]
-    Pwd { call_id: u32 },
+    Pwd { run: RunId },
     #[serde(rename = "cd")]
-    Cd { call_id: u32, path: String },
+    Cd { run: RunId, path: String },
     /// Run a command. The child answers with an [`ExecLine`](ChildMsg::ExecLine)
     /// per output line while the command runs, then the exit code.
     #[serde(rename = "exec")]
     Exec {
-        call_id: u32,
+        run: RunId,
         command: String,
         /// Sandbox-side working directory for the command. Never touches
         /// host paths: the caller translates before sending.
@@ -117,7 +128,7 @@ pub enum ParentMsg {
     },
     /// A filesystem operation executed inside the namespace.
     #[serde(rename = "fs")]
-    Fs { call_id: u32, op: FsOp },
+    Fs { run: RunId, op: FsOp },
 }
 
 /// Messages sent by the sandbox child to the parent.
@@ -136,33 +147,30 @@ pub enum ChildMsg {
     #[serde(rename = "setup")]
     Setup { error: Option<SandboxError> },
     #[serde(rename = "ls_result")]
-    LsResult {
-        call_id: u32,
-        entries: Vec<DirEntry>,
-    },
+    LsResult { run: RunId, entries: Vec<DirEntry> },
     #[serde(rename = "pwd_result")]
-    PwdResult { call_id: u32, path: String },
+    PwdResult { run: RunId, path: String },
     #[serde(rename = "cd_result")]
     CdResult {
-        call_id: u32,
+        run: RunId,
         /// Why the directory could not be entered, which is a failure of the
         /// call rather than output of a command.
         error: Option<String>,
     },
-    /// One output line of a running command, sent as it arrives. `call_id` is
-    /// the `Exec` that asked for it, so the caller watches one run and not the
+    /// One output line of a running command, sent as it arrives. `run` is the
+    /// `Exec` that asked for it, so the caller watches one run and not the
     /// whole child.
     #[serde(rename = "exec_line")]
     ExecLine {
-        call_id: u32,
+        run: RunId,
         stream: JobStream,
         line: String,
     },
-    /// The end of a command: no more lines are coming for this `call_id`.
+    /// The end of a command: no more lines are coming for this `run`.
     #[serde(rename = "exec_result")]
-    ExecResult { call_id: u32, exit_code: i32 },
+    ExecResult { run: RunId, exit_code: i32 },
     #[serde(rename = "fs_result")]
-    FsResult { call_id: u32, result: FsResult },
+    FsResult { run: RunId, result: FsResult },
 }
 
 /// A filesystem operation the child executes natively inside the namespace.
@@ -452,14 +460,14 @@ mod tests {
     fn parent_msg_ls_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ParentMsg::Ls {
-            call_id: 8,
+            run: RunId(8),
             path: "/tmp".into(),
         };
         send_parent_msg(&mut tx, &msg).unwrap();
         let got = recv_parent_msg(&mut rx).unwrap();
         match got {
-            ParentMsg::Ls { call_id, path } => {
-                assert_eq!(call_id, 8);
+            ParentMsg::Ls { run, path } => {
+                assert_eq!(run, RunId(8));
                 assert_eq!(path, "/tmp");
             }
             other => panic!("expected Ls, got {other:?}"),
@@ -469,23 +477,23 @@ mod tests {
     #[test]
     fn parent_msg_pwd_roundtrip() {
         let (mut tx, mut rx) = pair();
-        send_parent_msg(&mut tx, &ParentMsg::Pwd { call_id: 10 }).unwrap();
+        send_parent_msg(&mut tx, &ParentMsg::Pwd { run: RunId(10) }).unwrap();
         let got = recv_parent_msg(&mut rx).unwrap();
-        assert!(matches!(got, ParentMsg::Pwd { call_id: 10 }));
+        assert!(matches!(got, ParentMsg::Pwd { run: RunId(10) }));
     }
 
     #[test]
     fn parent_msg_cd_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ParentMsg::Cd {
-            call_id: 12,
+            run: RunId(12),
             path: "/home".into(),
         };
         send_parent_msg(&mut tx, &msg).unwrap();
         let got = recv_parent_msg(&mut rx).unwrap();
         match got {
-            ParentMsg::Cd { call_id, path } => {
-                assert_eq!(call_id, 12);
+            ParentMsg::Cd { run, path } => {
+                assert_eq!(run, RunId(12));
                 assert_eq!(path, "/home");
             }
             other => panic!("expected Cd, got {other:?}"),
@@ -496,7 +504,7 @@ mod tests {
     fn parent_msg_exec_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ParentMsg::Exec {
-            call_id: 13,
+            run: RunId(13),
             command: "ls -la".into(),
             workdir: Some("/home/maki/workspace/maki".into()),
             timeout_secs: Some(30),
@@ -505,12 +513,12 @@ mod tests {
         let got = recv_parent_msg(&mut rx).unwrap();
         match got {
             ParentMsg::Exec {
-                call_id,
+                run,
                 command,
                 workdir,
                 timeout_secs,
             } => {
-                assert_eq!(call_id, 13);
+                assert_eq!(run, RunId(13));
                 assert_eq!(command, "ls -la");
                 assert_eq!(workdir.as_deref(), Some("/home/maki/workspace/maki"));
                 assert_eq!(timeout_secs, Some(30));
@@ -523,7 +531,7 @@ mod tests {
     fn parent_msg_fs_read_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ParentMsg::Fs {
-            call_id: 20,
+            run: RunId(20),
             op: FsOp::Read {
                 path: "/home/maki/workspace/a.txt".into(),
                 max_bytes: 1024,
@@ -532,8 +540,8 @@ mod tests {
         send_parent_msg(&mut tx, &msg).unwrap();
         let got = recv_parent_msg(&mut rx).unwrap();
         match got {
-            ParentMsg::Fs { call_id, op } => {
-                assert_eq!(call_id, 20);
+            ParentMsg::Fs { run, op } => {
+                assert_eq!(run, RunId(20));
                 match op {
                     FsOp::Read { path, max_bytes } => {
                         assert_eq!(path, "/home/maki/workspace/a.txt");
@@ -551,7 +559,7 @@ mod tests {
         let (mut tx, mut rx) = pair();
         let content = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hi");
         let msg = ParentMsg::Fs {
-            call_id: 21,
+            run: RunId(21),
             op: FsOp::Write {
                 path: "/tmp/x".into(),
                 content,
@@ -561,13 +569,13 @@ mod tests {
         let got = recv_parent_msg(&mut rx).unwrap();
         match got {
             ParentMsg::Fs {
-                call_id,
+                run,
                 op: FsOp::Write { path, content },
             } => {
                 let got =
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content)
                         .unwrap();
-                assert_eq!(call_id, 21);
+                assert_eq!(run, RunId(21));
                 assert_eq!(path, "/tmp/x");
                 assert_eq!(got, b"hi");
             }
@@ -579,7 +587,7 @@ mod tests {
     fn parent_msg_fs_grep_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ParentMsg::Fs {
-            call_id: 22,
+            run: RunId(22),
             op: FsOp::Grep {
                 path: Some("/home/maki/workspace/src".into()),
                 pattern: "TODO".into(),
@@ -594,7 +602,7 @@ mod tests {
         let got = recv_parent_msg(&mut rx).unwrap();
         match got {
             ParentMsg::Fs {
-                call_id,
+                run,
                 op:
                     FsOp::Grep {
                         path,
@@ -606,7 +614,7 @@ mod tests {
                         max_line_bytes,
                     },
             } => {
-                assert_eq!(call_id, 22);
+                assert_eq!(run, RunId(22));
                 assert_eq!(path.as_deref(), Some("/home/maki/workspace/src"));
                 assert_eq!(pattern, "TODO");
                 assert_eq!(pattern, "TODO");
@@ -624,7 +632,7 @@ mod tests {
     fn child_msg_ls_result_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::LsResult {
-            call_id: 1,
+            run: RunId(1),
             entries: vec![DirEntry {
                 name: "src".into(),
                 is_dir: true,
@@ -633,8 +641,8 @@ mod tests {
         send_child_msg(&mut tx, &msg).unwrap();
         let got = recv_child_msg(&mut rx).unwrap();
         match got {
-            ChildMsg::LsResult { call_id, entries } => {
-                assert_eq!(call_id, 1);
+            ChildMsg::LsResult { run, entries } => {
+                assert_eq!(run, RunId(1));
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].name, "src");
                 assert!(entries[0].is_dir);
@@ -647,14 +655,14 @@ mod tests {
     fn child_msg_pwd_result_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::PwdResult {
-            call_id: 2,
+            run: RunId(2),
             path: "/home/maki/workspace".into(),
         };
         send_child_msg(&mut tx, &msg).unwrap();
         let got = recv_child_msg(&mut rx).unwrap();
         match got {
-            ChildMsg::PwdResult { call_id, path } => {
-                assert_eq!(call_id, 2);
+            ChildMsg::PwdResult { run, path } => {
+                assert_eq!(run, RunId(2));
                 assert_eq!(path, "/home/maki/workspace");
             }
             other => panic!("expected PwdResult, got {other:?}"),
@@ -665,13 +673,13 @@ mod tests {
     fn child_msg_cd_result_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::CdResult {
-            call_id: 4,
+            run: RunId(4),
             error: Some("no such directory".into()),
         };
         send_child_msg(&mut tx, &msg).unwrap();
         match recv_child_msg(&mut rx).unwrap() {
-            ChildMsg::CdResult { call_id, error } => {
-                assert_eq!(call_id, 4);
+            ChildMsg::CdResult { run, error } => {
+                assert_eq!(run, RunId(4));
                 assert_eq!(error.as_deref(), Some("no such directory"));
             }
             other => panic!("expected CdResult, got {other:?}"),
@@ -684,18 +692,14 @@ mod tests {
     fn child_msg_exec_line_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::ExecLine {
-            call_id: 5,
+            run: RunId(5),
             stream: JobStream::Stderr,
             line: "warning".into(),
         };
         send_child_msg(&mut tx, &msg).unwrap();
         match recv_child_msg(&mut rx).unwrap() {
-            ChildMsg::ExecLine {
-                call_id,
-                stream,
-                line,
-            } => {
-                assert_eq!(call_id, 5);
+            ChildMsg::ExecLine { run, stream, line } => {
+                assert_eq!(run, RunId(5));
                 assert_eq!(stream, JobStream::Stderr);
                 assert_eq!(line, "warning");
             }
@@ -707,13 +711,13 @@ mod tests {
     fn child_msg_exec_result_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::ExecResult {
-            call_id: 6,
+            run: RunId(6),
             exit_code: 3,
         };
         send_child_msg(&mut tx, &msg).unwrap();
         match recv_child_msg(&mut rx).unwrap() {
-            ChildMsg::ExecResult { call_id, exit_code } => {
-                assert_eq!(call_id, 6);
+            ChildMsg::ExecResult { run, exit_code } => {
+                assert_eq!(run, RunId(6));
                 assert_eq!(exit_code, 3);
             }
             other => panic!("expected ExecResult, got {other:?}"),
@@ -726,18 +730,18 @@ mod tests {
         let data =
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"\x00\xffhi");
         let msg = ChildMsg::FsResult {
-            call_id: 30,
+            run: RunId(30),
             result: FsResult::Ok(FsReply::Bytes { data }),
         };
         send_child_msg(&mut tx, &msg).unwrap();
         let got = recv_child_msg(&mut rx).unwrap();
         match got {
-            ChildMsg::FsResult { call_id, result } => match result {
+            ChildMsg::FsResult { run, result } => match result {
                 FsResult::Ok(FsReply::Bytes { data }) => {
                     let bytes =
                         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
                             .unwrap();
-                    assert_eq!(call_id, 30);
+                    assert_eq!(run, RunId(30));
                     assert_eq!(bytes, b"\x00\xffhi");
                 }
                 other => panic!("expected FsResult::Ok(Bytes), got {other:?}"),
@@ -750,14 +754,14 @@ mod tests {
     fn child_msg_fs_result_error_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::FsResult {
-            call_id: 31,
+            run: RunId(31),
             result: FsResult::Err("permission denied".into()),
         };
         send_child_msg(&mut tx, &msg).unwrap();
         let got = recv_child_msg(&mut rx).unwrap();
         match got {
-            ChildMsg::FsResult { call_id, result } => {
-                assert_eq!(call_id, 31);
+            ChildMsg::FsResult { run, result } => {
+                assert_eq!(run, RunId(31));
                 assert!(matches!(result, FsResult::Err(ref e) if e == "permission denied"));
             }
             other => panic!("expected FsResult, got {other:?}"),
@@ -768,14 +772,14 @@ mod tests {
     fn child_msg_fs_result_done_roundtrip() {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::FsResult {
-            call_id: 32,
+            run: RunId(32),
             result: FsResult::Ok(FsReply::Done),
         };
         send_child_msg(&mut tx, &msg).unwrap();
         let got = recv_child_msg(&mut rx).unwrap();
         match got {
-            ChildMsg::FsResult { call_id, result } => {
-                assert_eq!(call_id, 32);
+            ChildMsg::FsResult { run, result } => {
+                assert_eq!(run, RunId(32));
                 assert!(matches!(result, FsResult::Ok(FsReply::Done)));
             }
             other => panic!("expected FsResult, got {other:?}"),
@@ -787,28 +791,28 @@ mod tests {
         assert_eq!(child_msg_label(&ChildMsg::Setup { error: None }), "setup");
         assert_eq!(
             child_msg_label(&ChildMsg::LsResult {
-                call_id: 0,
+                run: RunId(0),
                 entries: vec![]
             }),
             "ls_result"
         );
         assert_eq!(
             child_msg_label(&ChildMsg::PwdResult {
-                call_id: 0,
+                run: RunId(0),
                 path: String::new()
             }),
             "pwd_result"
         );
         assert_eq!(
             child_msg_label(&ChildMsg::CdResult {
-                call_id: 0,
+                run: RunId(0),
                 error: None
             }),
             "cd_result"
         );
         assert_eq!(
             child_msg_label(&ChildMsg::ExecLine {
-                call_id: 0,
+                run: RunId(0),
                 stream: JobStream::Stdout,
                 line: String::new(),
             }),
@@ -816,14 +820,14 @@ mod tests {
         );
         assert_eq!(
             child_msg_label(&ChildMsg::ExecResult {
-                call_id: 0,
+                run: RunId(0),
                 exit_code: 0
             }),
             "exec_result"
         );
         assert_eq!(
             child_msg_label(&ChildMsg::FsResult {
-                call_id: 0,
+                run: RunId(0),
                 result: FsResult::Ok(FsReply::Done)
             }),
             "fs_result"
@@ -890,22 +894,22 @@ mod tests {
         assert_eq!(parent_msg_label(&ParentMsg::Exit), "exit");
         assert_eq!(
             parent_msg_label(&ParentMsg::Ls {
-                call_id: 0,
+                run: RunId(0),
                 path: String::new()
             }),
             "ls"
         );
-        assert_eq!(parent_msg_label(&ParentMsg::Pwd { call_id: 0 }), "pwd");
+        assert_eq!(parent_msg_label(&ParentMsg::Pwd { run: RunId(0) }), "pwd");
         assert_eq!(
             parent_msg_label(&ParentMsg::Cd {
-                call_id: 0,
+                run: RunId(0),
                 path: String::new()
             }),
             "cd"
         );
         assert_eq!(
             parent_msg_label(&ParentMsg::Exec {
-                call_id: 0,
+                run: RunId(0),
                 command: String::new(),
                 workdir: None,
                 timeout_secs: None
@@ -914,7 +918,7 @@ mod tests {
         );
         assert_eq!(
             parent_msg_label(&ParentMsg::Fs {
-                call_id: 0,
+                run: RunId(0),
                 op: FsOp::Exists {
                     path: String::new()
                 }

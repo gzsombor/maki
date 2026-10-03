@@ -52,6 +52,7 @@ sandbox = ["dep:maki-sandbox", "maki-sandbox/sandbox"]
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+maki-sandbox = { workspace = true, features = ["testing"] }
 maki-config = { workspace = true, features = ["test-util"] }
 test-case = { workspace = true }
 tempfile = { workspace = true }

@@ -191,7 +191,7 @@ mod sandbox_impl {
             if exec_only {
                 eprintln!("--- exec: {cmd} ---");
             }
-            match sandbox.exec_streaming(&cmd, None, None, Arc::new(Printing)) {
+            match sandbox.exec_streaming(sandbox.next_run(), &cmd, None, None, Arc::new(Printing)) {
                 Ok(exit_code) => {
                     if exec_only {
                         exit(exit_code);
@@ -251,7 +251,13 @@ mod sandbox_impl {
                     Err(e) => eprintln!("  error: {e}"),
                 }
             } else {
-                match sandbox.exec_streaming(cmd, None, None, Arc::new(Printing)) {
+                match sandbox.exec_streaming(
+                    sandbox.next_run(),
+                    cmd,
+                    None,
+                    None,
+                    Arc::new(Printing),
+                ) {
                     Ok(exit_code) => eprintln!("  exit: {exit_code}"),
                     Err(e) => eprintln!("  ipc error: {e}"),
                 }
