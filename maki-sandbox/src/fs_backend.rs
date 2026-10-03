@@ -224,7 +224,13 @@ impl FsBackend for SandboxFs {
         let config = self.config()?;
         let workdir = workdir.map(|w| self.sandbox_path(Path::new(w), &config));
         self.sandbox
-            .exec_streaming(command, workdir.as_deref(), timeout_secs, sink)
+            .exec_streaming(
+                self.sandbox.next_run(),
+                command,
+                workdir.as_deref(),
+                timeout_secs,
+                sink,
+            )
             .map_err(fs_err)
     }
 }
