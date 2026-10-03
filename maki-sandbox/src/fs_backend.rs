@@ -11,7 +11,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use maki_fs::grep::{GrepFileEntry, GrepParams};
-use maki_fs::{FsBackend, FsError};
+use maki_fs::{FsBackend, FsError, JobSink};
 use serde_json::Value;
 
 use crate::ipc::{FsOp, FsReply};
@@ -212,16 +212,19 @@ impl FsBackend for SandboxFs {
             .collect())
     }
 
+    /// The child streams every line of the run over IPC, so a sink here sees
+    /// the command as it runs rather than one report at the end.
     fn exec(
         &self,
         command: &str,
         workdir: Option<&str>,
         timeout_secs: Option<u64>,
-    ) -> Result<(String, i32), FsError> {
+        sink: Arc<dyn JobSink>,
+    ) -> Result<i32, FsError> {
         let config = self.config()?;
         let workdir = workdir.map(|w| self.sandbox_path(Path::new(w), &config));
         self.sandbox
-            .exec(command, workdir.as_deref(), timeout_secs)
+            .exec_streaming(command, workdir.as_deref(), timeout_secs, sink)
             .map_err(fs_err)
     }
 }

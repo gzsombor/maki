@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use maki_fs::{JobSink, JobStream};
 use nix::unistd::Pid;
 use tracing::{debug, warn};
 
@@ -12,7 +13,7 @@ use crate::error::SandboxError;
 use crate::ipc::{DirEntry, FsOp, FsReply, FsResult, ParentMsg};
 use crate::lock_or_poisoned;
 use crate::namespace::NamespaceConfig;
-use crate::{PendingMap, SandboxResponse};
+use crate::{PendingMap, SandboxResponse, StreamMap};
 
 /// Max wait for long-running requests (fs ops, execs).
 const RUN_TIMEOUT: Duration = Duration::from_mins(5);
@@ -35,6 +36,9 @@ struct SandboxInner {
     tx: Sender<ParentMsg>,
     next_id: Arc<AtomicU32>,
     pending: Arc<Mutex<PendingMap>>,
+    /// Sinks for the runs in flight, which the IO thread feeds from the
+    /// child's [`ExecLine`](crate::ipc::ChildMsg::ExecLine) messages.
+    streams: Arc<Mutex<StreamMap>>,
     io_handle: Option<JoinHandle<()>>,
     /// Current namespace config, kept for host↔sandbox path translation.
     config: NamespaceConfig,
@@ -61,12 +65,14 @@ impl Sandbox {
         debug!(pid = %pid.as_raw(), "sandbox: child spawned");
         let (tx, rx) = mpsc::channel::<ParentMsg>();
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let io_handle = crate::parent_io_thread(sock, rx, pending.clone())?;
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let io_handle = crate::parent_io_thread(sock, rx, pending.clone(), streams.clone())?;
         Ok(Arc::new(SandboxInner {
             pid,
             tx,
             next_id: Arc::new(AtomicU32::new(1)),
             pending,
+            streams,
             io_handle: Some(io_handle),
             config,
         }))
@@ -153,21 +159,20 @@ impl Sandbox {
     /// Returns [`SandboxError`] if no child is running or the query times out.
     pub fn ls(&self, path: &str) -> Result<Vec<DirEntry>, SandboxError> {
         let inner = self.inner()?;
-        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self.wait_for(
+        let call_id = next_call(&inner);
+        wait_for(
+            &inner,
             call_id,
             ParentMsg::Ls {
                 call_id,
                 path: path.to_owned(),
             },
             QUERY_TIMEOUT,
-        )?;
-        match response {
-            SandboxResponse::Ls(entries) => Ok(entries),
-            other => Err(SandboxError::Ipc(format!(
-                "expected LsResult, got {other:?}"
-            ))),
-        }
+            |response| match response {
+                SandboxResponse::Ls(entries) => Ok(entries),
+                other => Err(unexpected("LsResult", other)),
+            },
+        )
     }
 
     /// Query the sandbox's current working directory.
@@ -177,14 +182,17 @@ impl Sandbox {
     /// Returns [`SandboxError`] if no child is running or the query times out.
     pub fn pwd(&self) -> Result<String, SandboxError> {
         let inner = self.inner()?;
-        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self.wait_for(call_id, ParentMsg::Pwd { call_id }, QUERY_TIMEOUT)?;
-        match response {
-            SandboxResponse::Pwd(path) => Ok(path),
-            other => Err(SandboxError::Ipc(format!(
-                "expected PwdResult, got {other:?}"
-            ))),
-        }
+        let call_id = next_call(&inner);
+        wait_for(
+            &inner,
+            call_id,
+            ParentMsg::Pwd { call_id },
+            QUERY_TIMEOUT,
+            |response| match response {
+                SandboxResponse::Pwd(path) => Ok(path),
+                other => Err(unexpected("PwdResult", other)),
+            },
+        )
     }
 
     /// Change the sandbox's working directory.
@@ -195,44 +203,52 @@ impl Sandbox {
     /// or the directory does not exist inside the sandbox.
     pub fn cd(&self, path: &str) -> Result<(), SandboxError> {
         let inner = self.inner()?;
-        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self.wait_for(
+        let call_id = next_call(&inner);
+        wait_for(
+            &inner,
             call_id,
             ParentMsg::Cd {
                 call_id,
                 path: path.to_owned(),
             },
             QUERY_TIMEOUT,
-        )?;
-        match response {
-            SandboxResponse::Cd => Ok(()),
-            SandboxResponse::Exec((output, exit_code)) => Err(SandboxError::Ipc(format!(
-                "cd failed ({exit_code}): {output}"
-            ))),
-            other => Err(SandboxError::Ipc(format!(
-                "expected CdResult, got {other:?}"
-            ))),
-        }
+            |response| match response {
+                SandboxResponse::Cd => Ok(()),
+                other => Err(unexpected("CdResult", other)),
+            },
+        )
     }
 
-    /// Execute a shell command in the sandbox. Returns `(output, exit_code)`.
+    /// Execute a shell command in the sandbox, streaming its output.
     ///
-    /// `workdir` must already be a sandbox-side path; `timeout_secs` kills
-    /// the command after the deadline (reporting exit code 124).
+    /// `workdir` must already be a sandbox-side path. Every output line goes to
+    /// {sink} as the command writes it, and the call returns once the command
+    /// is gone, with its exit code. `timeout_secs` kills it after the deadline
+    /// (reporting exit code 124).
+    ///
+    /// Reporting the exit to the sink is the caller's business: only a caller
+    /// that owns the whole run promises the sink one, so [`exec`](Self::exec)
+    /// and `maki_fs::FsBackend::exec_job` are the shapes that do.
     ///
     /// # Errors
     ///
-    /// Returns [`SandboxError`] if no child is running, the exec times out,
-    /// or the child reports an I/O failure.
-    pub fn exec(
+    /// Returns [`SandboxError`] if no child is running, the exec times out, or
+    /// the child reports an I/O failure.
+    pub fn exec_streaming(
         &self,
         command: &str,
         workdir: Option<&str>,
         timeout_secs: Option<u64>,
-    ) -> Result<(String, i32), SandboxError> {
+        sink: Arc<dyn JobSink>,
+    ) -> Result<i32, SandboxError> {
+        // One child answers this call, so its map and its IO thread have to be
+        // the same one: a reinit in the middle would send the lines to a
+        // stream map this sink was never put in.
         let inner = self.inner()?;
-        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self.wait_for(
+        let call_id = next_call(&inner);
+        lock_or_poisoned(&inner.streams)?.insert(call_id, sink);
+        let result = wait_for(
+            &inner,
             call_id,
             ParentMsg::Exec {
                 call_id,
@@ -241,13 +257,44 @@ impl Sandbox {
                 timeout_secs,
             },
             RUN_TIMEOUT,
+            |response| match response {
+                SandboxResponse::Exec(exit_code) => Ok(exit_code),
+                other => Err(unexpected("ExecResult", other)),
+            },
+        );
+        // The IO thread drops the entry with the exit it routes, so this is
+        // only the path where no exit ever arrived.
+        drop(lock_or_poisoned(&inner.streams).map(|mut s| s.remove(&call_id)));
+        result
+    }
+
+    /// Execute a shell command in the sandbox, returning `(output, exit_code)`.
+    ///
+    /// The one-shot shape of [`exec_streaming`](Self::exec_streaming), for the
+    /// callers that only want the run's output at the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] if no child is running, the exec times out, or
+    /// the child reports an I/O failure.
+    pub fn exec(
+        &self,
+        command: &str,
+        workdir: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<(String, i32), SandboxError> {
+        let output = Arc::new(Mutex::new(String::new()));
+        let code = self.exec_streaming(
+            command,
+            workdir,
+            timeout_secs,
+            Arc::new(Collected(Arc::clone(&output))),
         )?;
-        match response {
-            SandboxResponse::Exec(result) => Ok(result),
-            other => Err(SandboxError::Ipc(format!(
-                "expected ExecResult, got {other:?}"
-            ))),
-        }
+        let output = match lock_or_poisoned(&output) {
+            Ok(output) => output,
+            Err(e) => return Err(SandboxError::MutexPoisoned(e.to_string())),
+        };
+        Ok((output.clone(), code))
     }
 
     /// Execute one filesystem operation inside the namespace.
@@ -261,53 +308,72 @@ impl Sandbox {
     /// the operation failed, or the reply fails to decode.
     pub fn fs(&self, op: FsOp) -> Result<FsReply, SandboxError> {
         let inner = self.inner()?;
-        let call_id = inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let response = self.wait_for(call_id, ParentMsg::Fs { call_id, op }, RUN_TIMEOUT)?;
-        match response {
-            SandboxResponse::Fs(FsResult::Ok(reply)) => Ok(reply),
-            SandboxResponse::Fs(FsResult::Err(message)) => Err(SandboxError::Ipc(message)),
-            other => Err(SandboxError::Ipc(format!(
-                "expected FsResult, got {other:?}"
-            ))),
-        }
+        let call_id = next_call(&inner);
+        wait_for(
+            &inner,
+            call_id,
+            ParentMsg::Fs { call_id, op },
+            RUN_TIMEOUT,
+            |response| match response {
+                SandboxResponse::Fs(FsResult::Ok(reply)) => Ok(reply),
+                SandboxResponse::Fs(FsResult::Err(message)) => Err(SandboxError::Ipc(message)),
+                other => Err(unexpected("FsResult", other)),
+            },
+        )
     }
+}
 
-    /// Register a waiter for `call_id`, send `msg`, and block for the
-    /// matching response (or the timeout).
-    fn wait_for(
-        &self,
-        call_id: u32,
-        msg: ParentMsg,
-        timeout: Duration,
-    ) -> Result<SandboxResponse, SandboxError> {
-        let inner = self.inner()?;
-        let (tx, rx) = mpsc::channel::<Result<SandboxResponse, String>>();
-        lock_or_poisoned(&inner.pending)?.insert(call_id, tx);
-        if inner.tx.send(msg).is_err() {
-            let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
-            return Err(SandboxError::Ipc("io thread disconnected".into()));
+/// The next call id, which the caller then registers a waiter for. Ids are
+/// per child, so a reinit starts over without colliding with the old one.
+fn next_call(inner: &SandboxInner) -> u32 {
+    inner.next_id.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Register a waiter for `call_id` on {inner}, send {msg}, and block for the
+/// response (or the timeout), turning it into the caller's answer.
+fn wait_for<T>(
+    inner: &SandboxInner,
+    call_id: u32,
+    msg: ParentMsg,
+    timeout: Duration,
+    from: impl FnOnce(SandboxResponse) -> Result<T, SandboxError>,
+) -> Result<T, SandboxError> {
+    let (tx, rx) = mpsc::channel::<Result<SandboxResponse, String>>();
+    lock_or_poisoned(&inner.pending)?.insert(call_id, tx);
+    if inner.tx.send(msg).is_err() {
+        let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+        return Err(SandboxError::Ipc("io thread disconnected".into()));
+    }
+    let received = match rx.recv_timeout(timeout) {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(message)) => Err(SandboxError::Ipc(message)),
+        Err(RecvTimeoutError::Timeout) => Err(SandboxError::Ipc(format!(
+            "sandbox call timed out after {timeout:?}"
+        ))),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(SandboxError::Ipc("sandbox io thread stopped".into()))
         }
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(response)) => {
-                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
-                Ok(response)
-            }
-            Ok(Err(message)) => {
-                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
-                Err(SandboxError::Ipc(message))
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
-                Err(SandboxError::Ipc(format!(
-                    "sandbox call timed out after {timeout:?}"
-                )))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
-                Err(SandboxError::Ipc("sandbox io thread stopped".into()))
-            }
+    };
+    let _ = lock_or_poisoned(&inner.pending)?.remove(&call_id);
+    received.and_then(from)
+}
+
+/// A sink that keeps a run's output as one string, which is what
+/// [`Sandbox::exec`] hands back.
+struct Collected(Arc<Mutex<String>>);
+
+impl JobSink for Collected {
+    fn line(&self, _: JobStream, line: String) {
+        if let Ok(mut output) = lock_or_poisoned(&self.0) {
+            output.push_str(&line);
+            output.push('\n');
         }
     }
+    fn exit(&self, _: i32) {}
+}
+
+fn unexpected(expected: &str, got: SandboxResponse) -> SandboxError {
+    SandboxError::Ipc(format!("expected {expected}, got {got:?}"))
 }
 
 impl Drop for SandboxInner {
@@ -328,8 +394,10 @@ mod tests {
     use std::fs::write;
     use std::ops::Deref;
     use std::path::Path;
+    use std::thread;
 
     use super::*;
+    use crate::child::EXIT_CODE_TIMED_OUT;
     use crate::namespace::NamespaceConfig;
 
     const SKIP_NO_NS: &str =
@@ -452,7 +520,46 @@ mod tests {
             eprintln!("{SKIP_NO_NS}");
             return;
         };
-        assert_eq!(exit_code, 124);
+        assert_eq!(exit_code, EXIT_CODE_TIMED_OUT);
+    }
+
+    /// A sink that forwards lines to a channel, so a test can look at them
+    /// while the run is still going.
+    struct Forwarding(mpsc::Sender<(JobStream, String)>);
+
+    impl JobSink for Forwarding {
+        fn line(&self, stream: JobStream, line: String) {
+            let _ = self.0.send((stream, line));
+        }
+        fn exit(&self, _: i32) {}
+    }
+
+    /// The line has to reach the sink while the command is still running: that
+    /// is the whole point of streaming through the child instead of reporting
+    /// one blob when the run returns.
+    #[test]
+    fn sandbox_exec_streams_a_line_before_the_command_ends() {
+        const LATE: &str = "the line only arrived after the command had ended";
+        const A_LINE: Duration = Duration::from_secs(10);
+        let Some(sandbox) = try_sandbox() else {
+            eprintln!("{SKIP_NO_NS}");
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+
+        let run = thread::spawn({
+            let sandbox = sandbox.sandbox.clone();
+            move || {
+                sandbox.exec_streaming("echo one; sleep 5", None, Some(2), Arc::new(Forwarding(tx)))
+            }
+        });
+
+        assert_eq!(
+            rx.recv_timeout(A_LINE).expect("a line the command wrote"),
+            (JobStream::Stdout, "one".to_string()),
+            "{LATE}"
+        );
+        assert_eq!(run.join().unwrap().unwrap(), EXIT_CODE_TIMED_OUT);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
+use maki_fs::{JobSink, JobStream};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, getgid, getuid};
@@ -129,16 +130,23 @@ pub fn wait_child(pid: Pid) -> Result<(), SandboxError> {
 }
 
 /// A response to a parent-originated sandbox request, matched by call id.
+/// An exec answers with just its exit code: its output already went to the
+/// caller's [`JobSink`](maki_fs::JobSink), line by line, while the command ran.
 #[derive(Debug)]
 pub enum SandboxResponse {
     Ls(Vec<DirEntry>),
     Pwd(String),
     Cd,
-    Exec((String, i32)),
+    Exec(i32),
     Fs(FsResult),
 }
 
 pub type PendingMap = HashMap<u32, Sender<Result<SandboxResponse, String>>>;
+
+/// Where the output of a running command goes, by the `Exec` call that asked
+/// for it. The child streams lines for one call at a time, and the IO thread
+/// drops the entry when that call reports its exit.
+pub type StreamMap = HashMap<u32, Arc<dyn JobSink>>;
 
 /// Parent-side IO handler for the sandbox child process.
 ///
@@ -149,6 +157,7 @@ struct ParentIo {
     sock: UnixStream,
     inbound: Receiver<ParentMsg>,
     pending: Arc<Mutex<PendingMap>>,
+    streams: Arc<Mutex<StreamMap>>,
 }
 
 /// Spawn the parent-side IO thread for a sandbox child socket.
@@ -156,11 +165,13 @@ pub(crate) fn parent_io_thread(
     sock: UnixStream,
     inbound: Receiver<ParentMsg>,
     pending: Arc<Mutex<PendingMap>>,
+    streams: Arc<Mutex<StreamMap>>,
 ) -> Result<std::thread::JoinHandle<()>, SandboxError> {
     let mut io = ParentIo {
         sock,
         inbound,
         pending,
+        streams,
     };
     std::thread::Builder::new()
         .name("sandbox-parent-io".into())
@@ -246,22 +257,48 @@ impl ParentIo {
                 self.deliver(call_id, Ok(SandboxResponse::Pwd(path)));
                 true
             }
-            ChildMsg::CdResult { call_id } => {
-                self.deliver(call_id, Ok(SandboxResponse::Cd));
+            ChildMsg::CdResult { call_id, error } => {
+                self.deliver(call_id, error.map_or(Ok(SandboxResponse::Cd), Err));
                 true
             }
-            ChildMsg::ExecResult {
+            ChildMsg::ExecLine {
                 call_id,
-                output,
-                exit_code,
+                stream,
+                line,
             } => {
-                self.deliver(call_id, Ok(SandboxResponse::Exec((output, exit_code))));
+                self.stream(call_id, stream, line);
+                true
+            }
+            ChildMsg::ExecResult { call_id, exit_code } => {
+                // The run is over, so nobody will stream into that call again.
+                drop(lock_or_poisoned(&self.streams).map(|mut s| s.remove(&call_id)));
+                self.deliver(call_id, Ok(SandboxResponse::Exec(exit_code)));
                 true
             }
             ChildMsg::FsResult { call_id, result } => {
                 self.deliver(call_id, Ok(SandboxResponse::Fs(result)));
                 true
             }
+        }
+    }
+
+    /// Hand one output line to the sink waiting on `call_id`, if any. A line
+    /// with no waiter is a command whose caller gave up on it, which is not a
+    /// reason to stop the child: the same reader serves the next call.
+    ///
+    /// The sink is called outside the lock: it belongs to the caller, and one
+    /// that calls back into the sandbox would otherwise deadlock this thread.
+    fn stream(&self, call_id: u32, stream: JobStream, line: String) {
+        let sink = match lock_or_poisoned(&self.streams) {
+            Ok(sinks) => sinks.get(&call_id).cloned(),
+            Err(e) => {
+                warn!("sandbox parent io: stream mutex poisoned: {e}");
+                return;
+            }
+        };
+        match sink {
+            Some(sink) => sink.line(stream, line),
+            None => debug!(call_id, "sandbox parent io: line for no watcher"),
         }
     }
 
@@ -281,11 +318,136 @@ impl ParentIo {
     }
 
     fn fail_all(&self, message: &str) {
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.clear();
+        }
         if let Ok(mut pending) = self.pending.lock() {
             for (call_id, tx) in pending.drain() {
                 debug!(call_id, "sandbox parent io: failing pending waiter");
                 let _ = tx.send(Err(message.to_string()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{Receiver, channel};
+    use std::time::Duration;
+
+    use maki_fs::JobSink;
+
+    use super::*;
+
+    const A_CALL: u32 = 7;
+    const ANOTHER_CALL: u32 = 8;
+    const NO_CALL: &str = "the sandbox io thread stopped routing";
+
+    #[derive(Default)]
+    struct Sink(Mutex<Vec<(JobStream, String)>>);
+
+    impl JobSink for Sink {
+        fn line(&self, stream: JobStream, line: String) {
+            self.0.lock().unwrap().push((stream, line));
+        }
+        fn exit(&self, _: i32) {}
+    }
+
+    /// An IO thread with nothing behind its socket, which routes messages the
+    /// way the real one does without a child to run.
+    fn io() -> ParentIo {
+        let (_inbound, rx) = channel();
+        ParentIo {
+            sock: UnixStream::pair().unwrap().0,
+            inbound: rx,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A run in flight: a sink collecting its lines and a waiter blocked on its
+    /// exit.
+    type Watcher = Receiver<Result<SandboxResponse, String>>;
+
+    fn watching(io: &ParentIo, call_id: u32) -> (Arc<Sink>, Watcher) {
+        let sink = Arc::new(Sink::default());
+        let (tx, rx) = channel();
+        io.streams.lock().unwrap().insert(call_id, sink.clone());
+        io.pending.lock().unwrap().insert(call_id, tx);
+        (sink, rx)
+    }
+
+    /// A line is handed to the sink that asked for it, with the stream it came
+    /// from, while that call is still waiting for its exit. Two runs in flight
+    /// never see each other's output.
+    #[test]
+    fn an_exec_line_reaches_the_sink_of_its_call() {
+        let mut io = io();
+        let (first, _waiting) = watching(&io, A_CALL);
+        let (second, _other_waiting) = watching(&io, ANOTHER_CALL);
+
+        assert!(io.route(ChildMsg::ExecLine {
+            call_id: A_CALL,
+            stream: JobStream::Stdout,
+            line: "one".into(),
+        }));
+        assert!(io.route(ChildMsg::ExecLine {
+            call_id: ANOTHER_CALL,
+            stream: JobStream::Stderr,
+            line: "two".into(),
+        }));
+
+        assert_eq!(
+            *first.0.lock().unwrap(),
+            [(JobStream::Stdout, "one".to_string())],
+            "{NO_CALL}"
+        );
+        assert_eq!(
+            *second.0.lock().unwrap(),
+            [(JobStream::Stderr, "two".to_string())],
+            "{NO_CALL}"
+        );
+    }
+
+    /// The exit ends the run: the waiting caller gets it, and nothing streams
+    /// into that call afterwards.
+    #[test]
+    fn an_exec_result_answers_the_waiter_and_closes_the_stream() {
+        let mut io = io();
+        let (sink, waiting) = watching(&io, A_CALL);
+
+        assert!(io.route(ChildMsg::ExecResult {
+            call_id: A_CALL,
+            exit_code: 3,
+        }));
+        assert!(
+            matches!(
+                waiting.recv_timeout(Duration::from_secs(5)),
+                Ok(Ok(SandboxResponse::Exec(3)))
+            ),
+            "the blocked caller has to learn the exit code"
+        );
+
+        io.route(ChildMsg::ExecLine {
+            call_id: A_CALL,
+            stream: JobStream::Stdout,
+            line: "late".into(),
+        });
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "a finished run has no lines left to report"
+        );
+    }
+
+    /// A line for a call nobody watches is dropped, not fatal: the child keeps
+    /// serving the calls after it.
+    #[test]
+    fn a_line_for_no_watcher_does_not_stop_the_routing() {
+        let mut io = io();
+        assert!(io.route(ChildMsg::ExecLine {
+            call_id: ANOTHER_CALL,
+            stream: JobStream::Stdout,
+            line: "orphan".into(),
+        }));
     }
 }
