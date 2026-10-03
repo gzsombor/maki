@@ -2,10 +2,10 @@
 //!
 //! Mirrors the sandbox child's native fs behavior byte-for-byte so the two
 //! backends are interchangeable: same error messages, same metadata/dir
-//! payload shapes. Job spawning is the one thing it does not share: a host
-//! job streams a process it spawns itself, which the sandbox cannot do, so
-//! [`FsBackend::exec_job`] is overridden here and the sandbox keeps the trait
-//! default that reports the whole output when the command returns.
+//! payload shapes, and the same lines out of a command, since both read their
+//! streams through [`LineSplitter`]. Job spawning is the one thing it does not
+//! share: only a host job owns a process, so [`FsBackend::exec_job`] is
+//! overridden here to hand back one that can be stopped.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -13,18 +13,19 @@ use std::fs::{
     File, FileType, OpenOptions, create_dir, create_dir_all, metadata, read_dir, remove_dir,
     remove_dir_all, remove_file, rename, set_permissions, symlink_metadata, write,
 };
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio, id};
+use std::process::{Child, Command, ExitStatus, Stdio, id};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::thread::sleep;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use maki_fs::grep::{GrepFileEntry, GrepParams};
 use maki_fs::search::{glob_walk, grep_search, mtime};
-use maki_fs::{FsBackend, FsError, JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream};
+use maki_fs::{
+    FsBackend, FsError, JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream, LineSplitter,
+};
 use maki_providers::strip_provider_keys;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
@@ -237,23 +238,21 @@ impl FsBackend for HostFs {
         command: &str,
         workdir: Option<&str>,
         timeout_secs: Option<u64>,
-    ) -> Result<(String, i32), FsError> {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
-        if let Some(dir) = workdir {
-            cmd.current_dir(dir);
-        }
-        let output = match timeout_secs {
-            Some(secs) => run_with_timeout(&mut cmd, secs),
-            None => cmd.output(),
-        }
-        .map_err(err)?;
-        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
-        Ok((
-            combined,
-            output.status.code().unwrap_or_else(|| signal_code(&output)),
-        ))
+        sink: Arc<dyn JobSink>,
+    ) -> Result<i32, FsError> {
+        let (mut child, readers) = spawn_host(
+            &JobCommand::Shell(command.to_owned()),
+            workdir.map(PathBuf::from),
+            None,
+            JobOut::Capture,
+            JobOut::Capture,
+            &sink,
+        )?;
+        let reaped = Arc::new(AtomicBool::new(false));
+        let _deadline = kill_after(child.id(), Arc::clone(&reaped), timeout_secs);
+        let code = wait_streamed(&mut child, readers);
+        reaped.store(true, Ordering::Relaxed);
+        Ok(code)
     }
 
     /// Spawn the job and stream it: one reader thread per piped stream
@@ -268,36 +267,17 @@ impl FsBackend for HostFs {
             stderr,
             sink,
         } = request;
-        let mut child = spawn_host(&command, workdir, env, stdout, stderr)?;
+        let (mut child, readers) = spawn_host(&command, workdir, env, stdout, stderr, &sink)?;
         let pid = child.id();
         let reaped = Arc::new(AtomicBool::new(false));
         let gone = Arc::clone(&reaped);
-        let readers = [
-            capture(
-                "job-stdout",
-                child.stdout.take(),
-                JobStream::Stdout,
-                Arc::clone(&sink),
-            )?,
-            capture(
-                "job-stderr",
-                child.stderr.take(),
-                JobStream::Stderr,
-                Arc::clone(&sink),
-            )?,
-        ];
         std::thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
                 // Reaping frees the pid, and that pid is the process group
-                // `JobHandle::kill` signals. The readers only return once
-                // every descendant dropped the pipes, so joining them first
-                // keeps a kill target around for as long as the job is
-                // really alive.
-                for reader in readers.into_iter().flatten() {
-                    let _ = reader.join();
-                }
-                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                // `JobHandle::kill` signals, so the flag has to be set before
+                // the exit is reported.
+                let code = wait_streamed(&mut child, readers);
                 gone.store(true, Ordering::Relaxed);
                 sink.exit(code);
             })
@@ -306,15 +286,48 @@ impl FsBackend for HostFs {
     }
 }
 
-/// Spawn {command} with the requested streams, in its own process group so
-/// one signal reaches everything it starts.
+/// Wait for a spawned command. The readers are joined first: they only return
+/// once every descendant dropped the pipes, so an exit can never overtake the
+/// last line, and a kill target stays around while the job is really alive.
+fn wait_streamed(child: &mut Child, readers: Vec<JoinHandle<()>>) -> i32 {
+    for reader in readers {
+        let _ = reader.join();
+    }
+    child
+        .wait()
+        .ok()
+        .map(|status| status.code().unwrap_or_else(|| signal_code(&status)))
+        .unwrap_or(-1)
+}
+
+/// A watchdog that kills the job's process group once `secs` have passed,
+/// unless the caller reaped it first: through a `JobHandle` a pid the kernel
+/// may already have handed to someone else is never signalled. Nothing waits
+/// for the watchdog, so a command that finished in time leaves it sleeping out
+/// a deadline instead of holding a pipe nobody reads.
+fn kill_after(pid: u32, reaped: Arc<AtomicBool>, secs: Option<u64>) -> Option<JoinHandle<()>> {
+    let secs = secs?;
+    std::thread::Builder::new()
+        .name("exec-timeout".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            JobHandle::spawned(pid, reaped).kill();
+        })
+        .ok()
+}
+
+/// Spawn {command} in its own process group, so one signal reaches everything
+/// it starts, piping the streams a sink should hear and one reader thread each.
+/// The child goes back to the caller with its readers, which own the wait: a
+/// stream that was redirected or dropped gets no reader at all.
 fn spawn_host(
     command: &JobCommand,
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
     stdout: JobOut,
     stderr: JobOut,
-) -> Result<Child, FsError> {
+    sink: &Arc<dyn JobSink>,
+) -> Result<(Child, Vec<JoinHandle<()>>), FsError> {
     let mut cmd = match command {
         JobCommand::Shell(line) => shell_command(line),
         JobCommand::Argv(argv) => {
@@ -349,7 +362,22 @@ fn spawn_host(
     for (key, value) in env.into_iter().flatten() {
         cmd.env(key, value);
     }
-    cmd.spawn().map_err(err)
+    let mut child = cmd.spawn().map_err(err)?;
+    let readers = [
+        capture(
+            "out-reader",
+            child.stdout.take(),
+            JobStream::Stdout,
+            Arc::clone(sink),
+        )?,
+        capture(
+            "err-reader",
+            child.stderr.take(),
+            JobStream::Stderr,
+            Arc::clone(sink),
+        )?,
+    ];
+    Ok((child, readers.into_iter().flatten().collect()))
 }
 
 fn stdio(out: JobOut) -> Result<Stdio, FsError> {
@@ -373,17 +401,26 @@ fn capture(
     which: JobStream,
     sink: Arc<dyn JobSink>,
 ) -> Result<Option<JoinHandle<()>>, FsError> {
-    let Some(stream) = stream else {
+    let Some(mut stream) = stream else {
         return Ok(None);
     };
     std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                .lines()
-                .map_while(Result::ok)
-            {
-                sink.line(which, line);
+            let mut splitter = LineSplitter::default();
+            let mut buf = [0u8; READER_BUF_SIZE];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        for line in splitter.push(&buf[..read]) {
+                            sink.line(which, line);
+                        }
+                    }
+                }
+            }
+            if let Some(last) = splitter.flush() {
+                sink.line(which, last);
             }
         })
         .map(Some)
@@ -406,53 +443,30 @@ fn shell_command(cmd: &str) -> Command {
 }
 
 #[cfg(unix)]
-fn signal_code(output: &Output) -> i32 {
+fn signal_code(status: &ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    128 + output.status.signal().unwrap_or(0)
+    128 + status.signal().unwrap_or(0)
 }
 
 #[cfg(not(unix))]
-fn signal_code(_output: &Output) -> i32 {
+fn signal_code(_status: &ExitStatus) -> i32 {
     0
-}
-
-fn run_with_timeout(cmd: &mut Command, secs: u64) -> io::Result<Output> {
-    let mut child = cmd.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let status = child.wait()?;
-                break status;
-            }
-            None => sleep(Duration::from_millis(10)),
-        }
-    };
-    let mut stdout = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_end(&mut stdout);
-    }
-    let mut stderr = Vec::new();
-    if let Some(mut s) = child.stderr.take() {
-        let _ = s.read_to_end(&mut stderr);
-    }
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs::read_to_string;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{self, Sender};
+    use std::thread;
+    use std::time::Duration;
 
     use test_case::test_case;
 
     use super::*;
     use tempfile::TempDir;
+
+    const STREAM_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[test_case(b""; "empty")]
     #[test_case(b"ab"; "below_limit")]
@@ -521,12 +535,88 @@ mod tests {
         assert_eq!(read_dir(tmp.path()).unwrap().count(), 1);
     }
 
+    /// Collects a run's output and passes its first line on, which is how a
+    /// test knows a line arrived while the command was still going.
+    struct Sink {
+        lines: Mutex<Vec<(JobStream, String)>>,
+        first: Sender<String>,
+    }
+
+    impl JobSink for Sink {
+        fn line(&self, stream: JobStream, line: String) {
+            let mut lines = self.lines.lock().unwrap();
+            if lines.is_empty() {
+                let _ = self.first.send(line.clone());
+            }
+            lines.push((stream, line));
+        }
+        fn exit(&self, _: i32) {}
+    }
+
+    fn sink() -> (Arc<Sink>, Arc<dyn JobSink>, mpsc::Receiver<String>) {
+        let (first, received) = mpsc::channel();
+        let sink = Arc::new(Sink {
+            lines: Mutex::new(Vec::new()),
+            first,
+        });
+        let erased = Arc::clone(&sink) as Arc<dyn JobSink>;
+        (sink, erased, received)
+    }
+
     #[test]
     fn exec_returns_output_and_code() {
-        let (out, code) = HostFs.exec("echo hi", None, None).unwrap();
-        assert_eq!(code, 0);
-        assert!(out.contains("hi"));
-        let (_, code) = HostFs.exec("exit 3", None, None).unwrap();
-        assert_eq!(code, 3);
+        let (collected, erased, _) = sink();
+        assert_eq!(HostFs.exec("echo hi", None, None, erased).unwrap(), 0);
+        assert_eq!(
+            *collected.lines.lock().unwrap(),
+            [(JobStream::Stdout, "hi".to_string())]
+        );
+        let (_, erased, _) = sink();
+        assert_eq!(HostFs.exec("exit 3", None, None, erased).unwrap(), 3);
+    }
+
+    /// Each line carries the stream it came from, so a caller can act on a
+    /// diagnostic without guessing from its text.
+    #[test]
+    fn exec_keeps_the_two_streams_apart() {
+        let (sink, erased, _) = sink();
+        HostFs
+            .exec("echo out; echo err 1>&2", None, None, erased)
+            .unwrap();
+        assert_eq!(
+            *sink.lines.lock().unwrap(),
+            [
+                (JobStream::Stdout, "out".to_string()),
+                (JobStream::Stderr, "err".to_string())
+            ]
+        );
+    }
+
+    /// The whole point of a sink: what a command wrote first is readable
+    /// while the run goes on, not gathered once it ended.
+    #[test]
+    fn exec_reports_a_line_before_the_command_ends() {
+        const LATE: &str = "the line only arrived after the command had ended";
+        let (sink, erased, received) = sink();
+        let host = Arc::new(HostFs);
+        let run = thread::spawn(move || {
+            host.exec("echo one; sleep 30", None, Some(1), erased)
+                .unwrap()
+        });
+
+        assert_eq!(
+            received.recv_timeout(STREAM_TIMEOUT).unwrap(),
+            "one",
+            "{LATE}"
+        );
+        assert!(
+            !sink.lines.lock().unwrap().is_empty(),
+            "the line has to be readable, not just announced: {LATE}"
+        );
+        assert_ne!(
+            run.join().unwrap(),
+            0,
+            "the timeout has to stop the command"
+        );
     }
 }

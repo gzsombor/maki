@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use maki_agent::AgentConfig;
+use maki_fs::{JobSink, JobStream};
 use maki_sandbox::Sandbox;
 use maki_sandbox::ipc::DirEntry;
 use maki_sandbox::namespace::{EnvEntry, NamespaceConfig};
@@ -62,10 +63,12 @@ pub(crate) enum SandboxModalEvent {
     Navigated(DirSnapshot),
     /// Shell tab requested a fresh child; carries the working directory.
     ShellReady(String),
-    /// A shell command finished.
+    /// One output line of a shell command, as the command wrote it.
+    ExecLine { run: u64, line: String },
+    /// A shell command finished. `run` names the entry its output belongs to.
     Executed {
-        command: String,
-        result: Result<(String, i32), String>,
+        run: u64,
+        result: Result<i32, String>,
     },
     /// Child respawn for a config change finished.
     ReinitDone,
@@ -220,19 +223,42 @@ fn expand_home(path: &str) -> String {
     }
 }
 
-/// A single entry in the shell output history.
+/// Hands a running command's lines to the UI thread, so the shell shows the
+/// run while it happens instead of when it ends.
+struct ShellLines {
+    tx: flume::Sender<SandboxModalEvent>,
+    run: u64,
+}
+
+impl JobSink for ShellLines {
+    fn line(&self, _: JobStream, line: String) {
+        let _ = self.tx.send(SandboxModalEvent::ExecLine {
+            run: self.run,
+            line,
+        });
+    }
+    /// A modal command reports its exit through [`SandboxModalEvent::Executed`],
+    /// which the run's own thread sends once the command is gone.
+    fn exit(&self, _: i32) {}
+}
+
+/// A single entry in the shell output history. `run` tells which run of the
+/// shell its lines belong to, so several commands in flight never mix.
 struct ShellEntry {
+    run: u64,
     command: String,
     output: String,
     is_error: bool,
 }
 
-/// Sandbox interactive shell state. Commands run in background jobs; results
-/// arrive via [`SandboxModalEvent::Executed`].
+/// Sandbox interactive shell state. Commands run in background jobs that
+/// stream their lines back as they arrive; results arrive via
+/// [`SandboxModalEvent::Executed`].
 struct SandboxShellState {
     cwd: String,
     input: String,
     entries: Vec<ShellEntry>,
+    next_run: u64,
     history: Vec<String>,
     history_pos: Option<usize>,
     error: Option<String>,
@@ -244,25 +270,45 @@ impl SandboxShellState {
             cwd: pwd,
             input: String::new(),
             entries: Vec::new(),
+            next_run: 0,
             history: Vec::new(),
             history_pos: None,
             error: None,
         }
     }
 
-    fn push_result(&mut self, command: String, result: Result<(String, bool), String>) {
+    /// Record a command as started, so its lines have somewhere to land while
+    /// it runs. Returns the run id they will carry.
+    fn start(&mut self, command: String) -> u64 {
+        let run = self.next_run;
+        self.next_run += 1;
+        self.entries.push(ShellEntry {
+            run,
+            command,
+            output: String::new(),
+            is_error: false,
+        });
+        self.error = None;
+        run
+    }
+
+    /// Append one streamed line to the run that wrote it.
+    fn push_line(&mut self, run: u64, line: String) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.run == run) {
+            entry.output.push_str(&line);
+            entry.output.push('\n');
+        }
+    }
+
+    /// Close a run out: a command that ran reports whether it failed, one that
+    /// could not run at all reports why.
+    fn finish(&mut self, run: u64, result: Result<i32, String>) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.run == run) else {
+            return;
+        };
         match result {
-            Ok((output, is_error)) => {
-                self.error = None;
-                self.entries.push(ShellEntry {
-                    command,
-                    output,
-                    is_error,
-                });
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
+            Ok(exit_code) => entry.is_error = exit_code != 0,
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -312,7 +358,9 @@ pub struct SandboxModal {
     sandbox: Option<Arc<Sandbox>>,
     browser: Option<SandboxFileBrowser>,
     shell: Option<SandboxShellState>,
-    shell_entry_count: usize,
+    /// Shell content lines rendered last time, so a run that grows the
+    /// transcript scrolls with it.
+    shell_content_lines: usize,
     /// In-flight spawn/navigate job; execs run untracked.
     pending: Option<PendingJob>,
     event_tx: Option<flume::Sender<SandboxModalEvent>>,
@@ -336,7 +384,7 @@ impl SandboxModal {
             sandbox,
             browser: None,
             shell: None,
-            shell_entry_count: 0,
+            shell_content_lines: 0,
             pending: None,
             event_tx: None,
             info_focus,
@@ -672,7 +720,7 @@ impl SandboxModal {
 
     fn close_shell(&mut self) {
         self.shell.take();
-        self.shell_entry_count = 0;
+        self.shell_content_lines = 0;
     }
 
     fn rebuild_env_entries(&mut self) {
@@ -768,7 +816,7 @@ impl SandboxModal {
             return;
         }
         self.close_browser();
-        self.shell_entry_count = 0;
+        self.shell_content_lines = 0;
         self.request_child(PendingJob::Shell, |sandbox| {
             SandboxModalEvent::ShellReady(sandbox.pwd().unwrap_or_default())
         });
@@ -833,21 +881,30 @@ impl SandboxModal {
         .detach();
     }
 
-    /// Run a shell command off the UI thread. Unlike spawns and navigations,
-    /// execs are untracked: several may be in flight and results append in
-    /// arrival order.
+    /// Run a shell command off the UI thread, streaming each of its lines back
+    /// as the command writes it. Unlike spawns and navigations, execs are
+    /// untracked: several may be in flight and each one's lines go to the entry
+    /// that started it.
     fn exec_command(&mut self, command: String) {
+        let Some(shell) = &mut self.shell else {
+            return;
+        };
+        // The entry goes in before the job starts, so the transcript shows the
+        // command while it runs instead of appearing with its output at the end.
+        let run = shell.start(command.clone());
         let (Some(tx), Some(sandbox)) = (self.event_tx.clone(), self.sandbox.clone()) else {
-            if let Some(shell) = &mut self.shell {
-                shell.error = Some("sandbox unavailable".into());
-            }
+            shell.error = Some("sandbox unavailable".into());
             return;
         };
         smol::unblock(move || {
+            let sink = Arc::new(ShellLines {
+                tx: tx.clone(),
+                run,
+            });
             let result = sandbox
-                .exec(&command, None, Some(MODAL_EXEC_TIMEOUT_SECS))
+                .exec_streaming(&command, None, Some(MODAL_EXEC_TIMEOUT_SECS), sink)
                 .map_err(|e| e.to_string());
-            let _ = tx.send(SandboxModalEvent::Executed { command, result });
+            let _ = tx.send(SandboxModalEvent::Executed { run, result });
         })
         .detach();
     }
@@ -913,9 +970,14 @@ impl SandboxModal {
                 self.pending = None;
                 self.spawn_error = Some(error);
             }
-            SandboxModalEvent::Executed { command, result } => {
+            SandboxModalEvent::ExecLine { run, line } => {
                 if let Some(shell) = &mut self.shell {
-                    shell.push_result(command, result.map(|(o, c)| (o, c != 0)));
+                    shell.push_line(run, line);
+                }
+            }
+            SandboxModalEvent::Executed { run, result } => {
+                if let Some(shell) = &mut self.shell {
+                    shell.finish(run, result);
                 }
             }
         }
@@ -1524,12 +1586,11 @@ impl SandboxModal {
 
                 let total = lines.len() as u16;
                 self.scroll.update_dimensions(total, content_area.height);
-                // Auto-scroll to bottom when new entries appear
-                if let Some(s) = &self.shell
-                    && s.entries.len() > self.shell_entry_count
-                {
+                // Follow the transcript while it grows, whether that is a new
+                // command or another line of one still running.
+                if total as usize > self.shell_content_lines {
                     self.scroll.scroll_to_bottom();
-                    self.shell_entry_count = s.entries.len();
+                    self.shell_content_lines = total as usize;
                 }
                 let scroll = self.scroll.offset();
                 frame.render_widget(
@@ -2045,30 +2106,119 @@ mod tests {
         assert_eq!(browser.total_entries(), 2, ".. plus original entry kept");
     }
 
-    #[test]
-    fn shell_executed_event_appends_entry_and_clears_error() {
+    fn shell_modal() -> SandboxModal {
         let mut modal = SandboxModal::new(info_with(true, 0), None);
-        modal.toggle();
         modal.mode = Mode::Shell;
         modal.shell = Some(SandboxShellState::new("/".into()));
+        modal
+    }
+
+    fn shell_text(modal: &mut SandboxModal) -> String {
+        let mut lines = Vec::new();
+        modal.render_shell(&mut lines);
+        lines_text(&lines)
+    }
+
+    #[test]
+    fn submitting_a_command_shows_it_before_it_produces_anything() {
+        let mut modal = shell_modal();
         modal.shell.as_mut().unwrap().input.push_str("echo hi");
         modal.handle_key(key_ev(KeyCode::Enter));
         let shell = modal.shell.as_ref().unwrap();
         assert_eq!(shell.history, ["echo hi"]);
         assert_eq!(shell.input, "", "input is cleared on submit");
+        assert_eq!(
+            shell
+                .entries
+                .iter()
+                .map(|e| e.command.as_str())
+                .collect::<Vec<_>>(),
+            ["echo hi"],
+            "the command is in the transcript before it runs"
+        );
+    }
+
+    /// Output has to be visible while the command is still running: that is
+    /// what streaming buys, and nothing marks the run finished before its exit.
+    #[test]
+    fn shell_output_is_shown_before_the_command_finishes() {
+        let mut modal = shell_modal();
+        let run = modal.shell.as_mut().unwrap().start("repeat.sh".into());
+
+        modal.apply(SandboxModalEvent::ExecLine {
+            run,
+            line: "loop 1".into(),
+        });
+        let text = shell_text(&mut modal);
+        assert!(
+            text.contains("loop 1"),
+            "a line of a running command is rendered:\n{text}"
+        );
+        assert!(
+            text.contains("repeat.sh"),
+            "the command it belongs to is rendered:\n{text}"
+        );
+    }
+
+    /// Execs are untracked, so several may be in flight: each line goes to the
+    /// run that wrote it.
+    #[test]
+    fn lines_land_in_the_run_that_wrote_them() {
+        let mut modal = shell_modal();
+        let shell = modal.shell.as_mut().unwrap();
+        let first = shell.start("first.sh".into());
+        let second = shell.start("second.sh".into());
+
+        modal.apply(SandboxModalEvent::ExecLine {
+            run: second,
+            line: "from second".into(),
+        });
+        modal.apply(SandboxModalEvent::ExecLine {
+            run: first,
+            line: "from first".into(),
+        });
+
+        let shell = modal.shell.as_ref().unwrap();
+        assert_eq!(shell.entries[0].output, "from first\n");
+        assert_eq!(shell.entries[1].output, "from second\n");
+    }
+
+    #[test]
+    fn a_nonzero_exit_marks_only_its_own_entry_as_an_error() {
+        let mut modal = shell_modal();
+        let shell = modal.shell.as_mut().unwrap();
+        let first = shell.start("echo hi".into());
+        let second = shell.start("false".into());
 
         modal.apply(SandboxModalEvent::Executed {
-            command: "echo hi".into(),
-            result: Ok(("hi".into(), 0)),
+            run: second,
+            result: Ok(1),
         });
         modal.apply(SandboxModalEvent::Executed {
-            command: "false".into(),
-            result: Ok((String::new(), 1)),
+            run: first,
+            result: Ok(0),
         });
+
         let shell = modal.shell.as_ref().unwrap();
-        assert_eq!(shell.entries.len(), 2);
+        assert!(!shell.entries[0].is_error);
         assert!(shell.entries[1].is_error);
         assert!(shell.error.is_none());
+    }
+
+    /// A command that never ran has no output to show, so the reason has to
+    /// reach the user some other way.
+    #[test]
+    fn a_command_that_could_not_run_reports_why() {
+        let mut modal = shell_modal();
+        let run = modal.shell.as_mut().unwrap().start("nope".into());
+        modal.apply(SandboxModalEvent::Executed {
+            run,
+            result: Err("child gone".into()),
+        });
+        assert_eq!(
+            modal.shell.as_ref().unwrap().error.as_deref(),
+            Some("child gone")
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub mod grep;
 pub mod job;
 pub mod search;
 pub use grep::{GrepFileEntry, GrepLine, GrepMatchGroup, GrepParams};
-pub use job::{JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream};
+pub use job::{JobCommand, JobHandle, JobOut, JobRequest, JobSink, JobStream, LineSplitter};
 
 /// An opaque filesystem/exec failure; the message is already human-readable
 /// and shown to the model verbatim.
@@ -91,23 +91,31 @@ pub trait FsBackend: Send + Sync + 'static {
     ) -> Result<Vec<PathBuf>, FsError>;
     /// Grep results with host-absolute `entry.path` values.
     fn grep(&self, params: GrepParams) -> Result<Vec<GrepFileEntry>, FsError>;
-    /// Run a command, returning `(output, exit_code)`.
+    /// Run a command to completion, handing every output line to {sink} as it
+    /// arrives, and return its exit code. Reporting an exit is the caller's
+    /// job: only [`exec_job`](Self::exec_job) promises the sink an
+    /// [`exit`](JobSink::exit), so a caller that has one waits here and
+    /// reports the code itself.
+    ///
+    /// A command that cannot run at all is an `Err` rather than an exit code:
+    /// the caller decides what its sink should hear about it.
     fn exec(
         &self,
         command: &str,
         workdir: Option<&str>,
         timeout_secs: Option<u64>,
-    ) -> Result<(String, i32), FsError>;
+        sink: Arc<dyn JobSink>,
+    ) -> Result<i32, FsError>;
 
     /// Start {request} in the background: its sink gets every output line
     /// and, last, the exit code. Returns as soon as the job is running, never
     /// after it finished.
     ///
-    /// The default runs the command to completion on a worker thread and
-    /// reports the whole output at once, the only shape a backend that
-    /// cannot stream can offer. `env` and a redirected stream go with it, and
-    /// a command that cannot run at all reports the reason as output and an
-    /// exit of 1. A backend that can spawn a process and stream it overrides
+    /// The default runs {exec} to completion on a worker thread, which streams
+    /// whatever that backend streams and hands over no process of its own, so
+    /// the job cannot be stopped. `env` and a redirected stream go with it. A
+    /// command that cannot run at all reports the reason as output and an exit
+    /// of 1. A backend that can spawn a process it can also signal overrides
     /// this.
     fn exec_job(self: Arc<Self>, request: JobRequest) -> Result<JobHandle, FsError> {
         let JobRequest {
@@ -121,19 +129,17 @@ pub trait FsBackend: Send + Sync + 'static {
         let reaped = Arc::new(AtomicBool::new(false));
         let gone = Arc::clone(&reaped);
         let backend = Arc::clone(&self);
+        let lines = Arc::clone(&sink);
         thread::Builder::new()
             .name("job-exec".into())
             .spawn(move || {
-                let (output, code) = match backend.exec(&line, workdir.as_deref(), None) {
-                    Ok(finished) => finished,
+                let code = match backend.exec(&line, workdir.as_deref(), None, lines) {
+                    Ok(code) => code,
                     Err(e) => {
                         sink.line(JobStream::Stdout, format!("exec failed: {e}"));
-                        (String::new(), 1)
+                        1
                     }
                 };
-                for line in output.lines() {
-                    sink.line(JobStream::Stdout, line.to_string());
-                }
                 gone.store(true, Ordering::Relaxed);
                 sink.exit(code);
             })

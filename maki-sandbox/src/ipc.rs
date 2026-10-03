@@ -1,3 +1,4 @@
+use maki_fs::JobStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -101,6 +102,8 @@ pub enum ParentMsg {
     Pwd { call_id: u32 },
     #[serde(rename = "cd")]
     Cd { call_id: u32, path: String },
+    /// Run a command. The child answers with an [`ExecLine`](ChildMsg::ExecLine)
+    /// per output line while the command runs, then the exit code.
     #[serde(rename = "exec")]
     Exec {
         call_id: u32,
@@ -140,13 +143,24 @@ pub enum ChildMsg {
     #[serde(rename = "pwd_result")]
     PwdResult { call_id: u32, path: String },
     #[serde(rename = "cd_result")]
-    CdResult { call_id: u32 },
-    #[serde(rename = "exec_result")]
-    ExecResult {
+    CdResult {
         call_id: u32,
-        output: String,
-        exit_code: i32,
+        /// Why the directory could not be entered, which is a failure of the
+        /// call rather than output of a command.
+        error: Option<String>,
     },
+    /// One output line of a running command, sent as it arrives. `call_id` is
+    /// the `Exec` that asked for it, so the caller watches one run and not the
+    /// whole child.
+    #[serde(rename = "exec_line")]
+    ExecLine {
+        call_id: u32,
+        stream: JobStream,
+        line: String,
+    },
+    /// The end of a command: no more lines are coming for this `call_id`.
+    #[serde(rename = "exec_result")]
+    ExecResult { call_id: u32, exit_code: i32 },
     #[serde(rename = "fs_result")]
     FsResult { call_id: u32, result: FsResult },
 }
@@ -338,6 +352,7 @@ fn child_msg_label(msg: &ChildMsg) -> &'static str {
         ChildMsg::LsResult { .. } => "ls_result",
         ChildMsg::PwdResult { .. } => "pwd_result",
         ChildMsg::CdResult { .. } => "cd_result",
+        ChildMsg::ExecLine { .. } => "exec_line",
         ChildMsg::ExecResult { .. } => "exec_result",
         ChildMsg::FsResult { .. } => "fs_result",
     }
@@ -649,9 +664,43 @@ mod tests {
     #[test]
     fn child_msg_cd_result_roundtrip() {
         let (mut tx, mut rx) = pair();
-        send_child_msg(&mut tx, &ChildMsg::CdResult { call_id: 4 }).unwrap();
-        let got = recv_child_msg(&mut rx).unwrap();
-        assert!(matches!(got, ChildMsg::CdResult { call_id: 4 }));
+        let msg = ChildMsg::CdResult {
+            call_id: 4,
+            error: Some("no such directory".into()),
+        };
+        send_child_msg(&mut tx, &msg).unwrap();
+        match recv_child_msg(&mut rx).unwrap() {
+            ChildMsg::CdResult { call_id, error } => {
+                assert_eq!(call_id, 4);
+                assert_eq!(error.as_deref(), Some("no such directory"));
+            }
+            other => panic!("expected CdResult, got {other:?}"),
+        }
+    }
+
+    /// The stream tag has to survive the socket: it is what lets a caller act
+    /// on a diagnostic without guessing from its text.
+    #[test]
+    fn child_msg_exec_line_roundtrip() {
+        let (mut tx, mut rx) = pair();
+        let msg = ChildMsg::ExecLine {
+            call_id: 5,
+            stream: JobStream::Stderr,
+            line: "warning".into(),
+        };
+        send_child_msg(&mut tx, &msg).unwrap();
+        match recv_child_msg(&mut rx).unwrap() {
+            ChildMsg::ExecLine {
+                call_id,
+                stream,
+                line,
+            } => {
+                assert_eq!(call_id, 5);
+                assert_eq!(stream, JobStream::Stderr);
+                assert_eq!(line, "warning");
+            }
+            other => panic!("expected ExecLine, got {other:?}"),
+        }
     }
 
     #[test]
@@ -659,19 +708,12 @@ mod tests {
         let (mut tx, mut rx) = pair();
         let msg = ChildMsg::ExecResult {
             call_id: 6,
-            output: "result".into(),
             exit_code: 3,
         };
         send_child_msg(&mut tx, &msg).unwrap();
-        let got = recv_child_msg(&mut rx).unwrap();
-        match got {
-            ChildMsg::ExecResult {
-                call_id,
-                output,
-                exit_code,
-            } => {
+        match recv_child_msg(&mut rx).unwrap() {
+            ChildMsg::ExecResult { call_id, exit_code } => {
                 assert_eq!(call_id, 6);
-                assert_eq!(output, "result");
                 assert_eq!(exit_code, 3);
             }
             other => panic!("expected ExecResult, got {other:?}"),
@@ -758,13 +800,23 @@ mod tests {
             "pwd_result"
         );
         assert_eq!(
-            child_msg_label(&ChildMsg::CdResult { call_id: 0 }),
+            child_msg_label(&ChildMsg::CdResult {
+                call_id: 0,
+                error: None
+            }),
             "cd_result"
+        );
+        assert_eq!(
+            child_msg_label(&ChildMsg::ExecLine {
+                call_id: 0,
+                stream: JobStream::Stdout,
+                line: String::new(),
+            }),
+            "exec_line"
         );
         assert_eq!(
             child_msg_label(&ChildMsg::ExecResult {
                 call_id: 0,
-                output: String::new(),
                 exit_code: 0
             }),
             "exec_result"

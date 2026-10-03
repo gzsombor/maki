@@ -3349,6 +3349,7 @@ dependencies = [
  "libc",
  "maki-agent",
  "maki-config",
+ "maki-fs",
  "maki-highlight",
  "maki-lua",
  "maki-markdown",

@@ -1,9 +1,11 @@
 //! Background jobs: run one on a backend and get its output as it runs.
 //!
-//! [`FsBackend::exec_job`](crate::FsBackend::exec_job) is the one shape for
-//! both ends of that: a host job streams a process the backend spawned itself,
-//! and a backend that can only run a command to completion reports the whole
-//! output once, when it returns.
+//! [`FsBackend::exec`](crate::FsBackend::exec) is the one shape for running a
+//! command: it streams every output line to a [`JobSink`] and returns the exit
+//! code, so a caller sees the run as it happens rather than after it ended.
+//! [`FsBackend::exec_job`](crate::FsBackend::exec_job) is the same run in the
+//! background: the sink also gets the exit, and the caller gets a handle to
+//! stop the process with.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::{Deserialize, Serialize};
 use shell_words::join as shell_join;
 
 /// A command to run: a shell line, or an argv the caller built itself so
@@ -40,7 +43,8 @@ impl JobCommand {
 }
 
 /// Which of a job's streams a line came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum JobStream {
     Stdout,
     Stderr,
@@ -50,6 +54,53 @@ pub enum JobStream {
 pub trait JobSink: Send + Sync {
     fn line(&self, stream: JobStream, line: String);
     fn exit(&self, code: i32);
+}
+
+/// Splits a raw output stream into the lines a [`JobSink`] hears, holding the
+/// trailing partial line until its newline arrives. Every backend reads its
+/// streams through this, so one command's lines read the same whether it ran
+/// on the host or inside the sandbox, and a multi-byte character split across
+/// two reads still decodes as one.
+#[derive(Default)]
+pub struct LineSplitter {
+    partial: Vec<u8>,
+}
+
+impl LineSplitter {
+    /// Add what one read returned, taking out every line it completed.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        for chunk in bytes.split_inclusive(|b| *b == b'\n') {
+            let (line, complete) = match chunk.split_last() {
+                Some((b'\n', rest)) => (rest, true),
+                _ => (chunk, false),
+            };
+            let line = match line.split_last() {
+                // A CR only ends the line when its LF did.
+                Some((b'\r', rest)) if complete => rest,
+                _ => line,
+            };
+            if !complete {
+                self.partial.extend_from_slice(line);
+                continue;
+            }
+            let line = if self.partial.is_empty() {
+                String::from_utf8_lossy(line).into_owned()
+            } else {
+                self.partial.extend_from_slice(line);
+                String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned()
+            };
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// Take out the trailing line a stream ended without a newline on, if it
+    /// wrote one at all.
+    pub fn flush(&mut self) -> Option<String> {
+        (!self.partial.is_empty())
+            .then(|| String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned())
+    }
 }
 
 /// Where one of a job's streams goes.
@@ -141,6 +192,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use serde_json::Value;
+    use test_case::test_case;
 
     use super::*;
     use crate::grep::{GrepFileEntry, GrepParams};
@@ -151,9 +203,9 @@ mod tests {
     const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-    /// A backend with one canned `exec` reply. Its fs side is never reached by
-    /// a job.
-    struct Fake(Result<(String, i32), String>);
+    /// A backend whose `exec` answers with a canned reply instead of running
+    /// anything. Its fs side is never reached by a job.
+    struct Fake(Result<(Vec<String>, i32), String>);
 
     impl FsBackend for Fake {
         fn read(&self, _: &Path, _: u64) -> Result<Vec<u8>, FsError> {
@@ -196,8 +248,18 @@ mod tests {
         fn grep(&self, _: GrepParams) -> Result<Vec<GrepFileEntry>, FsError> {
             unreachable!()
         }
-        fn exec(&self, _: &str, _: Option<&str>, _: Option<u64>) -> Result<(String, i32), FsError> {
-            self.0.clone().map_err(FsError::new)
+        fn exec(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<u64>,
+            sink: Arc<dyn JobSink>,
+        ) -> Result<i32, FsError> {
+            let (lines, code) = self.0.clone().map_err(FsError::new)?;
+            for line in lines {
+                sink.line(JobStream::Stdout, line);
+            }
+            Ok(code)
         }
     }
 
@@ -220,7 +282,9 @@ mod tests {
 
     /// Run a whole blocking job to completion, as a caller of the default
     /// `exec_job` would experience it.
-    fn run_blocking(reply: Result<(String, i32), String>) -> (Arc<Mutex<Recorded>>, JobHandle) {
+    fn run_blocking(
+        reply: Result<(Vec<String>, i32), String>,
+    ) -> (Arc<Mutex<Recorded>>, JobHandle) {
         let recorded = Arc::new(Mutex::new(Recorded::default()));
         let handle = Arc::new(Fake(reply))
             .exec_job(JobRequest {
@@ -241,8 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn a_backend_without_streaming_reports_every_line_then_the_exit() {
-        let (recorded, handle) = run_blocking(Ok(("one\ntwo\n".into(), 3)));
+    fn a_default_job_reports_its_lines_then_the_exit() {
+        let lines = ["one".to_string(), "two".to_string()].to_vec();
+        let (recorded, handle) = run_blocking(Ok((lines, 3)));
         let recorded = recorded.lock().unwrap();
 
         assert_eq!(
@@ -271,6 +336,35 @@ mod tests {
             recorded.lines
         );
         assert_eq!(recorded.exit, Some(1));
+    }
+
+    /// A line only reaches the sink once its newline does, so a command that
+    /// writes without one keeps its last line until the stream ends.
+    #[test_case(b"one\ntwo\nthree", &["one", "two"], Some("three"); "no_trailing_newline")]
+    #[test_case(b"one\ntwo\n", &["one", "two"], None; "every_line_complete")]
+    #[test_case(b"\n", &[""], None; "empty_line")]
+    #[test_case(b"one\r\n", &["one"], None; "crlf")]
+    #[test_case(b"one\rtwo", &[], Some("one\rtwo"); "bare_cr_is_not_a_line_break")]
+    #[test_case(b"", &[], None; "flush_of_an_empty_stream")]
+    #[test_case(b"tail", &[], Some("tail"); "flush_returns_the_remainder")]
+    #[test_case(b"one\ntwo\nthree\n", &["one", "two", "three"], None; "one_read_many_lines")]
+    fn lines_split_on_newlines_only(bytes: &[u8], before_flush: &[&str], tail: Option<&str>) {
+        let mut splitter = LineSplitter::default();
+        assert_eq!(splitter.push(bytes), before_flush);
+        assert_eq!(splitter.flush().as_deref(), tail);
+    }
+
+    /// A read can end mid-character: the halves only decode as one string once
+    /// they are joined.
+    #[test]
+    fn a_line_split_across_reads_joins_back_into_one() {
+        let mut line = vec![0xC3, 0xA9];
+        line.extend_from_slice(b"fin\n");
+        let (head, tail) = line.split_at(1);
+        let mut splitter = LineSplitter::default();
+
+        assert!(splitter.push(head).is_empty());
+        assert_eq!(splitter.push(tail), ["éfin"]);
     }
 
     #[test]
