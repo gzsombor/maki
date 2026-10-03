@@ -4,11 +4,29 @@ mod sandbox_impl {
     use std::io::{self, Write};
     use std::path::PathBuf;
     use std::process::exit;
+    use std::sync::Arc;
 
     use tracing_subscriber::EnvFilter;
 
+    use maki_fs::{JobSink, JobStream};
     use maki_sandbox::Sandbox;
     use maki_sandbox::profiles;
+
+    /// Prints a command's lines as they arrive, tagged with the stream they
+    /// came from, so a run reads like a terminal.
+    struct Printing;
+
+    impl JobSink for Printing {
+        fn line(&self, stream: JobStream, line: String) {
+            let prefix = match stream {
+                JobStream::Stdout => "OUT",
+                JobStream::Stderr => "ERR",
+            };
+            eprintln!("  {prefix}: {line}");
+        }
+        /// `-x` reports the exit itself, by using it as the process exit code.
+        fn exit(&self, _: i32) {}
+    }
 
     fn print_ls(sandbox: &Sandbox, label: &str, path: &str) {
         eprintln!("--- ls {label} ---");
@@ -173,12 +191,8 @@ mod sandbox_impl {
             if exec_only {
                 eprintln!("--- exec: {cmd} ---");
             }
-            match sandbox.exec(&cmd, None, None) {
-                Ok((output, exit_code)) => {
-                    let prefix = if exit_code != 0 { "ERR" } else { "OUT" };
-                    for line in output.lines() {
-                        eprintln!("  {prefix}: {line}");
-                    }
+            match sandbox.exec_streaming(&cmd, None, None, Arc::new(Printing)) {
+                Ok(exit_code) => {
                     if exec_only {
                         exit(exit_code);
                     }
@@ -237,13 +251,8 @@ mod sandbox_impl {
                     Err(e) => eprintln!("  error: {e}"),
                 }
             } else {
-                match sandbox.exec(cmd, None, None) {
-                    Ok((output, exit_code)) => {
-                        let prefix = if exit_code != 0 { "ERR" } else { "OUT" };
-                        for line in output.lines() {
-                            eprintln!("  {prefix}: {line}");
-                        }
-                    }
+                match sandbox.exec_streaming(cmd, None, None, Arc::new(Printing)) {
+                    Ok(exit_code) => eprintln!("  exit: {exit_code}"),
                     Err(e) => eprintln!("  ipc error: {e}"),
                 }
             }
