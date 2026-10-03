@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::error::SandboxError;
-use crate::ipc::{self, ChildMsg, DirEntry, FsOp, FsReply, FsResult, ParentMsg};
+use crate::ipc::{self, ChildMsg, DirEntry, FsOp, FsReply, FsResult, ParentMsg, RunId};
 use crate::namespace::{self, NamespaceConfig};
 
 const ENV_SANDBOX_FD: &str = "MAKI_SANDBOX_FD";
@@ -222,49 +222,42 @@ fn handle_parent_msg(sock: &mut UnixStream, msg: ParentMsg) -> bool {
     match msg {
         ParentMsg::Exit => false,
         ParentMsg::Exec {
-            call_id,
+            run,
             command,
             workdir,
             timeout_secs,
-        } => exec_streaming(sock, call_id, &command, workdir.as_deref(), timeout_secs),
-        ParentMsg::Ls { call_id, path } => ipc::send_child_msg(
+        } => exec_streaming(sock, run, &command, workdir.as_deref(), timeout_secs),
+        ParentMsg::Ls { run, path } => ipc::send_child_msg(
             sock,
             &ChildMsg::LsResult {
-                call_id,
+                run,
                 entries: list_dir_entries(&path),
             },
         )
         .is_ok(),
-        ParentMsg::Pwd { call_id } => {
+        ParentMsg::Pwd { run } => {
             let path = current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            ipc::send_child_msg(sock, &ChildMsg::PwdResult { call_id, path }).is_ok()
+            ipc::send_child_msg(sock, &ChildMsg::PwdResult { run, path }).is_ok()
         }
-        ParentMsg::Cd { call_id, path } => match set_current_dir(&path) {
-            Ok(()) => ipc::send_child_msg(
-                sock,
-                &ChildMsg::CdResult {
-                    call_id,
-                    error: None,
-                },
-            )
-            .is_ok(),
+        ParentMsg::Cd { run, path } => match set_current_dir(&path) {
+            Ok(()) => ipc::send_child_msg(sock, &ChildMsg::CdResult { run, error: None }).is_ok(),
             Err(e) => {
                 warn!(path = %path, error = %e, "sandbox child: cd failed");
                 ipc::send_child_msg(
                     sock,
                     &ChildMsg::CdResult {
-                        call_id,
+                        run,
                         error: Some(format!("cd failed: {e}")),
                     },
                 )
                 .is_ok()
             }
         },
-        ParentMsg::Fs { call_id, op } => {
+        ParentMsg::Fs { run, op } => {
             let result = handle_fs(op);
-            ipc::send_child_msg(sock, &ChildMsg::FsResult { call_id, result }).is_ok()
+            ipc::send_child_msg(sock, &ChildMsg::FsResult { run, result }).is_ok()
         }
     }
 }
@@ -276,23 +269,14 @@ fn handle_parent_msg(sock: &mut UnixStream, msg: ParentMsg) -> bool {
 /// Returns false once the socket is gone.
 fn exec_streaming(
     sock: &mut UnixStream,
-    call_id: u32,
+    run: RunId,
     command: &str,
     workdir: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> bool {
     let mut socket_lost = false;
     let exit_code = match sandbox_exec(command, workdir, timeout_secs, |stream, line| {
-        if ipc::send_child_msg(
-            sock,
-            &ChildMsg::ExecLine {
-                call_id,
-                stream,
-                line,
-            },
-        )
-        .is_err()
-        {
+        if ipc::send_child_msg(sock, &ChildMsg::ExecLine { run, stream, line }).is_err() {
             socket_lost = true;
         }
     }) {
@@ -304,7 +288,7 @@ fn exec_streaming(
             let _ = ipc::send_child_msg(
                 sock,
                 &ChildMsg::ExecLine {
-                    call_id,
+                    run,
                     stream: JobStream::Stderr,
                     line: e.to_string(),
                 },
@@ -312,7 +296,7 @@ fn exec_streaming(
             1
         }
     };
-    ipc::send_child_msg(sock, &ChildMsg::ExecResult { call_id, exit_code }).is_ok() && !socket_lost
+    ipc::send_child_msg(sock, &ChildMsg::ExecResult { run, exit_code }).is_ok() && !socket_lost
 }
 
 /// Execute a filesystem operation inside the namespace.
@@ -813,7 +797,7 @@ mod tests {
     use crate::{PendingMap, SandboxResponse, StreamMap};
     use tempfile::TempDir;
 
-    const A_CALL: u32 = 3;
+    const A_RUN: RunId = RunId(3);
 
     /// Long enough that a line from a command still running cannot have been
     /// held back by the deadline of an unrelated test.
@@ -869,16 +853,16 @@ mod tests {
         streams
             .lock()
             .unwrap()
-            .insert(A_CALL, Arc::new(Forwarding(lines)));
+            .insert(A_RUN, Arc::new(Forwarding(lines)));
         let (waiting, exited) = channel();
-        pending.lock().unwrap().insert(A_CALL, waiting);
+        pending.lock().unwrap().insert(A_RUN, waiting);
         let io = crate::parent_io_thread(parent_sock, requests, pending, streams).unwrap();
 
         let child = thread::spawn(move || {
             handle_parent_msg(
                 &mut child_sock,
                 ParentMsg::Exec {
-                    call_id: A_CALL,
+                    run: A_RUN,
                     command: format!("echo one; {NEVER_RETURNS}"),
                     workdir: None,
                     timeout_secs: Some(1),
