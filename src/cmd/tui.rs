@@ -8,7 +8,6 @@ use std::time::Instant;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_agent::AgentConfig;
 use maki_agent::command::{self, CustomCommand};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, ProjectDecision, TrustAnswer, TrustMode, policy_grant};
@@ -238,7 +237,7 @@ fn build_stack(
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 fn setup_sandbox(
     plugin_host: &mut PluginHost,
-    agent_config: &AgentConfig,
+    agent_config: &maki_agent::AgentConfig,
 ) -> Result<Option<Arc<maki_sandbox::Sandbox>>> {
     if agent_config.sandbox_enabled {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
