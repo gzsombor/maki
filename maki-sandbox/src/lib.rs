@@ -1,5 +1,6 @@
 #![cfg(all(feature = "sandbox", target_os = "linux"))]
 
+pub mod apparmor;
 pub mod child;
 pub mod error;
 pub mod fs_backend;

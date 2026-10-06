@@ -195,8 +195,26 @@ Use `profiles::select_profiles()` to resolve configured names against the built-
 - `tests/common/mod.rs` -- shared `sandbox_for` helper
 
 The integration tests need user namespace support: `CLONE_NEWUSER` must be
-unprivileged (`/proc/sys/kernel/unprivileged_userns_clone=1` on most distros, or
-`kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu), and `CLONE_NEWNS`
-must be allowed. Where the host cannot isolate, `sandbox_for` prints the reason
-and returns `None` so the test passes without asserting. Any other construction
-failure is a defect and panics.
+unprivileged (`/proc/sys/kernel/unprivileged_userns_clone=1` on most distros),
+`CLONE_NEWNS` must be allowed, and where AppArmor restricts unprivileged user
+namespaces the `maki-sandbox` profile must be loaded (see `src/apparmor.rs`).
+Where the host cannot isolate, `sandbox_for` prints the
+reason and returns `None` so the test passes without asserting. Any other
+construction failure is a defect and panics.
+
+## AppArmor
+
+When `kernel.apparmor_restrict_unprivileged_userns=1` is armed, that sysctl is
+not what blocks the sandbox. What blocks it is that AppArmor moves an unconfined
+process into the `unprivileged_userns` profile the moment it calls
+`unshare(CLONE_NEWUSER)`, and that profile denies every capability. The sandbox
+needs `CAP_SYS_ADMIN` inside the user namespace it just created, so
+`unshare(CLONE_NEWNS)` returns `EPERM`.
+
+`bwrap` works with the sysctl left at `1` because AppArmor ships
+`/etc/apparmor.d/bwrap-userns-restrict`, a profile granting `userns`,
+`capability` and `mount` for `/usr/bin/bwrap`. `src/apparmor.rs` renders the
+equivalent profile for maki's binaries and prints the two commands that install
+it. Loading policy needs `CAP_MAC_ADMIN`, so it stays a one-time root step --
+the same one the `apparmor` package performs for `bwrap`. Turning the sysctl off
+also works, but it weakens every program on the host, not just maki.
