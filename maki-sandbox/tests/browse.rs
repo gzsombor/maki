@@ -7,10 +7,10 @@ mod common;
 /// Test that a sandbox browser can be spawned, list files, and navigate
 /// directories.
 ///
-/// Needs `/proc/sys/kernel/unprivileged_userns_clone=1` on most distros, or
-/// `kernel.apparmor_restrict_unprivileged_userns=0` on Ubuntu, plus a mount
-/// namespace. [`common::sandbox_for`] skips the test where the host gives us
-/// neither.
+/// Needs `/proc/sys/kernel/unprivileged_userns_clone=1` on most distros, plus a
+/// mount namespace. When AppArmor restricts unprivileged user namespaces the
+/// `maki-sandbox` profile must be loaded too (see `maki_sandbox::apparmor`).
+/// [`common::sandbox_for`] skips the test where the host gives us none of it.
 #[test]
 fn sandbox_browser_listing() {
     let dir = tempfile::TempDir::new().expect("temp dir");
