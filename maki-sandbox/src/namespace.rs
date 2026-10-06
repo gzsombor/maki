@@ -10,6 +10,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, getgid, getuid};
 use tracing::{debug, warn};
 
+use crate::apparmor;
 use crate::error::SandboxError;
 use crate::ipc::{self, SYNC_GO, SYNC_READY};
 
@@ -19,6 +20,11 @@ pub const DEFAULT_ALLOWED_ENV: &[&str] = &["LANG", "TERM", "TMPDIR", "RUST_LOG"]
 const TMPFS_FLAGS: MsFlags = MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV);
 
 const DEVICE_NAMES: &[&str] = &["null", "zero", "full", "random", "urandom", "console"];
+
+/// Exit codes of the throwaway fork in [`probe`].
+const PROBE_OK: i32 = 0;
+const PROBE_NO_MOUNTNS: i32 = 1;
+const PROBE_NO_USERNS: i32 = 2;
 
 const ENV_DESCRIPTIONS: &[(&str, &str)] = &[
     ("LANG", "locale"),
@@ -478,9 +484,17 @@ pub fn isolate_user_ns(sock: &mut UnixStream) -> Result<(), SandboxError> {
 /// make the sandbox's paths mean anything, and serving the host filesystem
 /// under sandbox paths would quietly break every fs call instead of failing
 /// them.
+///
+/// Call this *after* [`isolate_user_ns`]. Whether the refusal came from
+/// AppArmor taking our capabilities away is only observable from inside the
+/// new user namespace, where the profile transition has already happened.
 pub fn isolate_mount_ns() -> Result<(), SandboxError> {
-    unshare(CloneFlags::CLONE_NEWNS)
-        .map_err(|e| SandboxError::IsolationUnavailable(e.to_string()))?;
+    unshare(CloneFlags::CLONE_NEWNS).map_err(|e| {
+        SandboxError::IsolationUnavailable(format!(
+            "{e}\n\n{}",
+            diagnose_mount_ns_blocked(apparmor::capabilities_stripped())
+        ))
+    })?;
     debug!("sandbox: mount namespace isolated");
     Ok(())
 }
@@ -780,13 +794,20 @@ pub fn probe() -> Result<(), SandboxError> {
         ForkResult::Child => {
             drop(sync_rx);
             if unshare(CloneFlags::CLONE_NEWUSER).is_err() {
-                std::process::exit(2);
+                std::process::exit(PROBE_NO_USERNS);
             }
             sync_tx.write_all(b"\x01").ok();
             let mut buf = [0u8; 1];
             sync_tx.read_exact(&mut buf).ok();
-            let ok = unshare(CloneFlags::CLONE_NEWNS).is_ok();
-            std::process::exit(i32::from(!ok));
+            if unshare(CloneFlags::CLONE_NEWNS).is_ok() {
+                std::process::exit(PROBE_OK);
+            }
+            // Only observable here: the AppArmor profile transition happens as
+            // part of the CLONE_NEWUSER above, so the parent is still
+            // unconfined and cannot read the child's confinement itself.
+            let stripped = u8::from(apparmor::capabilities_stripped());
+            sync_tx.write_all(&[stripped]).ok();
+            std::process::exit(PROBE_NO_MOUNTNS);
         }
         ForkResult::Parent { child: child_pid } => {
             drop(sync_tx);
@@ -800,6 +821,8 @@ pub fn probe() -> Result<(), SandboxError> {
             sync_rx
                 .write_all(b"\x01")
                 .map_err(|e| SandboxError::Ipc(format!("probe: write child sync: {e}")))?;
+            let mut caps_stripped = [0u8; 1];
+            sync_rx.read_exact(&mut caps_stripped).ok();
             let exit_code = match waitpid(child_pid, None) {
                 Ok(WaitStatus::Exited(_, code)) => code,
                 Ok(WaitStatus::Signaled(_, sig, _)) => {
@@ -817,9 +840,11 @@ pub fn probe() -> Result<(), SandboxError> {
                 }
             };
             match exit_code {
-                0 => Ok(()),
-                1 => Err(SandboxError::Namespace(diagnose_mount_ns_blocked())),
-                2 => Err(SandboxError::Namespace(
+                PROBE_OK => Ok(()),
+                PROBE_NO_MOUNTNS => Err(SandboxError::Namespace(diagnose_mount_ns_blocked(
+                    caps_stripped[0] != 0,
+                ))),
+                PROBE_NO_USERNS => Err(SandboxError::Namespace(
                     "user namespace (CLONE_NEWUSER) is not available on this system.\n\
                      Without user namespaces the sandbox cannot isolate processes.\n\n\
                      To use --sandbox, try:\n\
@@ -839,46 +864,200 @@ pub fn probe() -> Result<(), SandboxError> {
     }
 }
 
-fn diagnose_mount_ns_blocked() -> String {
+/// Host-side facts that explain a refused `unshare(CLONE_NEWNS)`.
+///
+/// Every field is a recorded answer, never a live probe: [`diagnose`] reads
+/// this struct and nothing else, so a test can drive any combination of them
+/// without owning the host.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Host {
+    /// The sandbox landed in AppArmor's `unprivileged_userns` profile, which
+    /// allows the user namespace but denies every capability. Observed inside
+    /// the new user namespace, since that is where the transition happens.
+    apparmor_stripped_caps: bool,
+    /// The host arms the AppArmor userns restriction at all.
+    apparmor_restrict: bool,
+    /// The active kernel lockdown mode, if the host reports one.
+    lockdown: Option<String>,
+    /// The container runtime hosting us, if any.
+    container: Option<Container>,
+}
+
+impl Host {
+    /// Collect the host's own answers. `caps_stripped` is the only input that
+    /// cannot come from this process: the AppArmor profile transition happened
+    /// in the child, inside the user namespace.
+    fn read(caps_stripped: bool) -> Self {
+        Self {
+            apparmor_stripped_caps: caps_stripped,
+            apparmor_restrict: apparmor::restrict_userns_enabled(),
+            lockdown: read_lockdown(),
+            container: read_container(),
+        }
+    }
+}
+
+/// The container runtime the host's own hints name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Podman,
+    Docker,
+    Lxc,
+    Other,
+}
+
+impl Container {
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Podman => "podman",
+            Self::Docker => "docker",
+            Self::Lxc => "lxc",
+            Self::Other => "an OCI",
+        }
+    }
+
+    /// Map a runtime name, as the `container` environment variable, systemd's
+    /// `container` file, or a cgroup path reports it.
+    fn from_name(name: &str) -> Option<Self> {
+        match name.trim() {
+            "podman" => Some(Self::Podman),
+            "docker" | "containerd" | "kubernetes" => Some(Self::Docker),
+            "lxc" | "lxc-libvirt" | "systemd-nspawn" => Some(Self::Lxc),
+            "oci" | "rkt" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// Map the fragments a runtime leaves in `/proc/1/cgroup`. Podman writes
+    /// `libpod-<id>`, docker and containerd write their own name, and
+    /// Kubernetes writes `kubepods`.
+    fn from_cgroup(cgroup: &str) -> Option<Self> {
+        if cgroup.contains("libpod") || cgroup.contains("podman") {
+            Some(Self::Podman)
+        } else if cgroup.contains("docker")
+            || cgroup.contains("containerd")
+            || cgroup.contains("kubepods")
+        {
+            Some(Self::Docker)
+        } else if cgroup.contains("lxc") {
+            Some(Self::Lxc)
+        } else {
+            None
+        }
+    }
+}
+
+/// Podman's in-container marker. Empty, so presence is the whole signal.
+const PODMAN_MARKER: &str = "/run/.containerenv";
+/// Docker's in-container marker.
+const DOCKER_MARKER: &str = "/.dockerenv";
+/// What systemd-nspawn and `systemd-detect-virt -c` write: the runtime name.
+const SYSTEMD_CONTAINER: &str = "/run/systemd/container";
+/// The OCI-standard environment variable naming the runtime.
+const CONTAINER_ENV: &str = "container";
+const CGROUP_PATH: &str = "/proc/1/cgroup";
+const LOCKDOWN_PATH: &str = "/sys/kernel/security/lockdown";
+
+/// Resolve the container runtime from the host's own hints, most specific
+/// first: a runtime marker file beats the name a runtime exported, which beats
+/// guessing from a cgroup path.
+///
+/// Pure so tests do not have to run inside a container. `read` answers for the
+/// filesystem and returns `None` for anything absent, and `container_env`
+/// carries the `container` variable.
+fn detect_container(
+    read: &dyn Fn(&str) -> Option<String>,
+    container_env: Option<&str>,
+) -> Option<Container> {
+    if read(PODMAN_MARKER).is_some() {
+        return Some(Container::Podman);
+    }
+    if read(DOCKER_MARKER).is_some() {
+        return Some(Container::Docker);
+    }
+    if let Some(runtime) = read(SYSTEMD_CONTAINER)
+        && let Some(container) = Container::from_name(&runtime)
+    {
+        return Some(container);
+    }
+    if let Some(runtime) = container_env
+        && let Some(container) = Container::from_name(runtime)
+    {
+        return Some(container);
+    }
+    read(CGROUP_PATH).and_then(|cgroup| Container::from_cgroup(&cgroup))
+}
+
+/// The lockdown mode the host reports between brackets, e.g. `integrity`.
+/// The file lists every supported mode with the active one bracketed:
+/// `none [integrity] confidentiality`.
+fn parse_lockdown(content: &str) -> Option<String> {
+    content
+        .split_whitespace()
+        .find(|word| word.starts_with('[') && word.ends_with(']'))
+        .map(|word| word[1..word.len() - 1].to_owned())
+}
+
+/// Lockdown modes that block the namespace syscalls the sandbox depends on.
+const LOCKDOWN_BLOCKING_MODES: &[&str] = &["integrity", "confidentiality"];
+
+fn lockdown_blocks_userns(mode: Option<&str>) -> bool {
+    mode.is_some_and(|mode| LOCKDOWN_BLOCKING_MODES.contains(&mode))
+}
+
+fn read_container() -> Option<Container> {
+    detect_container(
+        &|path| std::fs::read_to_string(path).ok(),
+        std::env::var(CONTAINER_ENV).ok().as_deref(),
+    )
+}
+
+fn read_lockdown() -> Option<String> {
+    std::fs::read_to_string(LOCKDOWN_PATH)
+        .ok()
+        .as_deref()
+        .and_then(parse_lockdown)
+}
+
+fn diagnose_mount_ns_blocked(caps_stripped: bool) -> String {
+    diagnose(&Host::read(caps_stripped))
+}
+
+fn diagnose(host: &Host) -> String {
     let mut msg = String::from(
         "Mount namespaces (CLONE_NEWNS) are blocked on this system.\n\
-         The sandbox requires creating a mount namespace for filesystem isolation.\n\n\
+         The sandbox builds its filesystem inside a user namespace it creates itself,\n\
+         so unshare(CLONE_NEWNS) needs CAP_SYS_ADMIN there. That call just failed.\n\n\
          Detected:\n",
     );
 
     let mut any_clue = false;
 
-    let apparmor_val =
-        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
-    let lockdown_mode = std::fs::read_to_string("/sys/kernel/security/lockdown").ok();
-    let in_container = Path::new("/run/.containerenv").exists()
-        || std::fs::read_to_string("/proc/1/cgroup")
-            .is_ok_and(|c| c.contains("docker") || c.contains("lxc") || c.contains("containerd"));
+    if host.apparmor_stripped_caps {
+        msg.push_str(
+            "  - AppArmor confined the sandbox to 'unprivileged_userns', which grants\n\
+             \x20   the user namespace but denies every capability inside it\n",
+        );
+        any_clue = true;
+    }
 
-    if let Some(val) = &apparmor_val
-        && val.trim() == "1"
-    {
+    if host.apparmor_restrict {
         msg.push_str("  - kernel.apparmor_restrict_unprivileged_userns=1\n");
         any_clue = true;
     }
 
-    if let Some(mode) = &lockdown_mode {
-        let active = mode
-            .split_whitespace()
-            .find(|w| w.starts_with('[') && w.ends_with(']'))
-            .map(|w| &w[1..w.len() - 1]);
-        if let Some(active) = active
-            && (active == "integrity" || active == "confidentiality")
-        {
-            msg.push_str("  - kernel lockdown=");
-            msg.push_str(active);
-            msg.push_str(" (usually enabled by Secure Boot)\n");
-            any_clue = true;
-        }
+    if lockdown_blocks_userns(host.lockdown.as_deref()) {
+        msg.push_str("  - kernel lockdown=");
+        msg.push_str(host.lockdown.as_deref().unwrap_or_default());
+        msg.push_str(" (usually enabled by Secure Boot)\n");
+        any_clue = true;
     }
 
-    if in_container {
-        msg.push_str("  - running inside a container\n");
+    if let Some(container) = host.container {
+        msg.push_str("  - running inside a ");
+        msg.push_str(container.label());
+        msg.push_str(" container\n");
         any_clue = true;
     }
 
@@ -888,31 +1067,42 @@ fn diagnose_mount_ns_blocked() -> String {
 
     msg.push_str("\nTo use --sandbox, try one of:\n");
 
-    if let Some(val) = &apparmor_val
-        && val.trim() == "1"
-    {
-        msg.push_str("  - Disable AppArmor userns restriction:\n");
+    if host.apparmor_stripped_caps || host.apparmor_restrict {
+        msg.push_str(&apparmor::install_instructions(
+            &apparmor::sandbox_binaries()
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    if host.apparmor_restrict && !host.apparmor_stripped_caps {
+        // No `unprivileged_userns` profile is loaded, so AppArmor denies the
+        // namespace outright and no profile of ours will attach until one is.
+        msg.push_str("  - Load AppArmor's bundled profile for unprivileged user namespaces:\n");
+        msg.push_str("      sudo apt install apparmor\n");
+    }
+
+    if host.apparmor_restrict {
+        msg.push_str(
+            "  - Last resort, weakening every program on the host rather than just maki:\n",
+        );
         msg.push_str("      sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n");
         msg.push_str("    Or make permanent: add 'kernel.apparmor_restrict_unprivileged_userns=0' to /etc/sysctl.conf\n");
     }
 
-    if let Some(mode) = &lockdown_mode {
-        let active = mode
-            .split_whitespace()
-            .find(|w| w.starts_with('[') && w.ends_with(']'))
-            .map(|w| &w[1..w.len() - 1]);
-        if let Some(active) = active
-            && (active == "integrity" || active == "confidentiality")
-        {
-            msg.push_str("  - Disable Secure Boot in your BIOS/UEFI settings, then reboot\n");
-            msg.push_str("  - Or add 'lockdown=none' to the kernel cmdline:\n");
-            msg.push_str("      Edit /etc/default/grub: GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX lockdown=none\"\n");
-            msg.push_str("      Then: sudo update-grub && reboot\n");
-        }
+    if lockdown_blocks_userns(host.lockdown.as_deref()) {
+        msg.push_str("  - Disable Secure Boot in your BIOS/UEFI settings, then reboot\n");
+        msg.push_str("  - Or add 'lockdown=none' to the kernel cmdline:\n");
+        msg.push_str("      Edit /etc/default/grub: GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX lockdown=none\"\n");
+        msg.push_str("      Then: sudo update-grub && reboot\n");
     }
 
-    if in_container {
-        msg.push_str("  - Run the container with --privileged flag\n");
+    if let Some(container) = host.container {
+        msg.push_str(&format!(
+            "  - Run the container with --privileged ({} run --privileged)\n",
+            container.label()
+        ));
         msg.push_str("  - Run maki on the host system directly\n");
     }
 
@@ -1042,6 +1232,191 @@ pub fn write_uid_map(child_pid: Pid, uid: u32, gid: u32) -> Result<(), SandboxEr
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use test_case::test_case;
+
+    fn host(stripped: bool, lockdown: Option<&str>, container: Option<Container>) -> Host {
+        Host {
+            apparmor_stripped_caps: stripped,
+            apparmor_restrict: stripped,
+            lockdown: lockdown.map(str::to_owned),
+            container,
+        }
+    }
+
+    #[test_case(true, Some("integrity"), None; "apparmor")]
+    #[test_case(true, Some("none"), None; "apparmor_with_harmless_lockdown")]
+    #[test_case(false, None, Some(Container::Podman); "podman_container")]
+    #[test_case(false, Some("confidentiality"), None; "lockdown")]
+    #[test_case(false, None, None; "unknown")]
+    fn diagnosis_names_every_detected_restriction(
+        stripped: bool,
+        lockdown: Option<&str>,
+        container: Option<Container>,
+    ) {
+        let msg = diagnose(&host(stripped, lockdown, container));
+        assert!(
+            msg.contains("Mount namespaces (CLONE_NEWNS) are blocked"),
+            "the failing call must be named: {msg}"
+        );
+        if stripped {
+            assert!(
+                msg.contains("unprivileged_userns"),
+                "the profile that stripped our capabilities is the cause: {msg}"
+            );
+            assert!(
+                msg.contains("Install maki's AppArmor profile"),
+                "the profile is the fix, matching how bwrap works: {msg}"
+            );
+        }
+        if lockdown_blocks_userns(lockdown) {
+            assert!(
+                msg.contains("lockdown="),
+                "lockdown must be reported: {msg}"
+            );
+        }
+        if let Some(container) = container {
+            assert!(
+                msg.contains(&format!("running inside a {} container", container.label())),
+                "{msg}"
+            );
+        }
+        if !stripped && lockdown.is_none() && container.is_none() {
+            assert!(msg.contains("unrecognized kernel restriction"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn apparmor_restriction_prefers_the_profile_over_the_sysctl() {
+        let msg = diagnose(&host(true, None, None));
+        let profile = msg.find("Install maki's AppArmor profile").unwrap();
+        let sysctl = msg
+            .find("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+            .unwrap();
+        assert!(
+            profile < sysctl,
+            "weakening the host must be the last resort, not the first suggestion: {msg}"
+        );
+        assert!(msg.contains("stays at 1"), "{msg}");
+    }
+
+    #[test]
+    fn restriction_without_the_userns_profile_also_names_the_missing_one() {
+        let mut host = host(false, None, None);
+        host.apparmor_restrict = true;
+        let msg = diagnose(&host);
+        // No transition means AppArmor's bundled unprivileged_userns profile is
+        // not loaded, so it denies the namespace outright. Our profile cannot
+        // attach until the system one is there.
+        assert!(
+            msg.contains("sudo apt install apparmor"),
+            "the missing system profile must be named: {msg}"
+        );
+        assert!(
+            msg.contains("Install maki's AppArmor profile"),
+            "capabilities stay denied either way, so our profile is still needed: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_podman_container_gets_its_own_advice() {
+        let msg = diagnose(&host(false, None, Some(Container::Podman)));
+        assert!(
+            msg.contains("running inside a podman container"),
+            "the runtime must be named, not just 'a container': {msg}"
+        );
+        assert!(msg.contains("podman run --privileged"), "{msg}");
+    }
+
+    #[test_case(Some("integrity"), true; "integrity")]
+    #[test_case(Some("confidentiality"), true; "confidentiality")]
+    #[test_case(Some("none"), false; "none")]
+    #[test_case(None, false; "absent")]
+    fn only_lockdown_modes_that_block_namespaces_are_reported(mode: Option<&str>, blocks: bool) {
+        assert_eq!(lockdown_blocks_userns(mode), blocks);
+    }
+
+    #[test]
+    fn lockdown_mode_is_the_bracketed_one() {
+        assert_eq!(
+            parse_lockdown("none [integrity] confidentiality").as_deref(),
+            Some("integrity")
+        );
+        assert_eq!(
+            parse_lockdown("none integrity confidentiality").as_deref(),
+            None,
+            "nothing bracketed means no mode is active"
+        );
+    }
+
+    /// [`detect_container`] against a stand-in filesystem holding only
+    /// `files`, so no test has to run inside a container.
+    fn container_from(files: &[(&str, &str)], container_env: Option<&str>) -> Option<Container> {
+        let read = |path: &str| -> Option<String> {
+            files
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, body)| (*body).to_owned())
+        };
+        detect_container(&read, container_env)
+    }
+
+    #[test]
+    fn detects_podman_from_its_marker_file() {
+        assert_eq!(
+            container_from(&[(PODMAN_MARKER, "")], None),
+            Some(Container::Podman)
+        );
+    }
+
+    #[test]
+    fn detects_podman_from_a_rootless_cgroup() {
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-8f1.scope";
+        assert_eq!(
+            container_from(&[(CGROUP_PATH, cgroup)], None),
+            Some(Container::Podman)
+        );
+    }
+
+    #[test]
+    fn detects_docker_from_its_marker_file() {
+        assert_eq!(
+            container_from(&[(DOCKER_MARKER, "")], None),
+            Some(Container::Docker)
+        );
+    }
+
+    #[test]
+    fn detects_the_runtime_systemd_records() {
+        assert_eq!(
+            container_from(&[(SYSTEMD_CONTAINER, "podman\n")], None),
+            Some(Container::Podman)
+        );
+    }
+
+    #[test]
+    fn detects_the_runtime_exported_as_an_environment_variable() {
+        assert_eq!(container_from(&[], Some("docker")), Some(Container::Docker));
+    }
+
+    #[test]
+    fn a_marker_beats_any_other_hint() {
+        assert_eq!(
+            container_from(
+                &[(PODMAN_MARKER, ""), (CGROUP_PATH, "0::/init.scope")],
+                None
+            ),
+            Some(Container::Podman)
+        );
+    }
+
+    #[test]
+    fn reports_no_container_on_a_bare_host() {
+        assert_eq!(
+            container_from(&[(CGROUP_PATH, "0::/init.scope")], None),
+            None
+        );
+        assert_eq!(container_from(&[], None), None);
+    }
 
     fn config_with_env(allowed: Vec<&str>) -> NamespaceConfig {
         NamespaceConfig::new(
